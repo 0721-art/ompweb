@@ -1,0 +1,42 @@
+import "../tests/setup-dom.mjs";
+import assert from "node:assert/strict";
+import test from "node:test";
+import { act, createElement } from "react";
+const { cleanup, fireEvent, render, within } = await import("@testing-library/react/pure.js");
+const { GithubTokenSettings } = await import("./GithubTokenSettings");
+const settle = () => act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+
+test("PAT settings save without retaining the secret, test the limit and remove the token", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => { cleanup(); globalThis.fetch = original; });
+  const requests = [];
+  globalThis.fetch = async (url, init = {}) => {
+    assert.equal(url, "/api/github-token");
+    requests.push(init);
+    if (init.method === "DELETE") return Response.json({ set: false, last4: null, rejected: false });
+    if (init.method === "POST") return Response.json({ set: true, last4: "1234", rejected: true, limit: 60 });
+    return Response.json({ set: true, last4: "1234", rejected: false });
+  };
+  const { container } = render(createElement(GithubTokenSettings));
+  await settle();
+  const page = within(container);
+  const field = page.getByLabelText("GitHub token");
+  assert.equal(field.type, "password");
+  assert.equal(field.value, "");
+  assert.match(container.textContent, /1234/);
+  fireEvent.change(field, { target: { value: "github_pat_private1234" } });
+  fireEvent.click(page.getByRole("button", { name: "Save" }));
+  await settle();
+  assert.equal(requests.at(-1).body, '{"token":"github_pat_private1234"}');
+  assert.equal(field.value, "");
+  assert.equal(container.textContent.includes("github_pat_private1234"), false);
+  fireEvent.click(page.getByRole("button", { name: "Test" }));
+  await settle();
+  assert.equal(requests.at(-1).method, "POST");
+  assert.match(container.textContent, /60 requests per hour/);
+  assert.match(container.textContent, /GitHub token rejected/);
+  fireEvent.click(page.getByRole("button", { name: "Remove" }));
+  await settle();
+  assert.equal(requests.at(-1).method, "DELETE");
+  assert.match(container.textContent, /Not set/);
+});
