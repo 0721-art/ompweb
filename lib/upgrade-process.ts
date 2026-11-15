@@ -253,6 +253,24 @@ async function signalProcess(pid: number, signal: NodeJS.Signals): Promise<void>
   }
 }
 
+async function waitFrozen(pid: number, identity: string | null): Promise<void> {
+  const deadline = Date.now() + STOP_TIMEOUT_MS;
+  try {
+    while (true) {
+      if (!identity || await processStartIdentity(pid) !== identity) fail(`Cannot confirm the stopped identity of process ${pid}`);
+      const state = process.platform === "linux"
+        ? (() => { const stat = readFileSync(`/proc/${pid}/stat`, "utf8"); return stat.slice(stat.lastIndexOf(")") + 2)[0]; })()
+        : (await exec("ps", ["-o", "stat=", "-p", String(pid)], { timeout: 5000, encoding: "utf8" })).stdout.trim()[0];
+      if (await processStartIdentity(pid) !== identity) fail(`Process ${pid} changed while confirming its stopped state`);
+      if (state === "T") return;
+      if (!state || state === "Z" || Date.now() > deadline) fail(`Cannot confirm process ${pid} is frozen`);
+      await pause(100);
+    }
+  } catch (error) {
+    throw Object.assign(error instanceof Error ? error : new Error(String(error)), { code: "stop_pending" });
+  }
+}
+
 /** The process runs a host daemon (`ompweb host`, or the package's omp-web-host.js) or, for a server, anything else. */
 function isHostCommand(args: string[]): boolean {
   return args.slice(0, 4).some((arg, index) => basename(arg.replaceAll("\\", "/")) === "omp-web-host.js" || (index > 0 && arg === "host"));
@@ -869,11 +887,13 @@ export async function stopUpgradeProcess(plan: UpgradeProcess): Promise<void> {
       await signalProcess(sup.pid, "SIGSTOP");
       let launcherFrozen = false, stopStarted = false;
       try {
+        await waitFrozen(sup.pid, sup.identity);
         if (pid !== null && plan.role === "server" && runsInstallScript(plan.args, plan.installDir, "bin/omp-web.js")) {
           if (await runningInstance(plan) !== pid) fail("The package launcher exited before its server child could be stopped");
           // Freeze before discovery: a launcher waiting for its port can still spawn a child.
           await signalProcess(pid, "SIGSTOP");
           launcherFrozen = true;
+          await waitFrozen(pid, plan.current.identity);
           const children = (await listProcesses()).filter((row) => row.ppid === pid && row.state !== "Z" && belongsToInstall(row, plan.installDir) && !isHostCommand(row.args));
           if (children.length > 1 || children.some((row) => !runsInstallScript(row.args, plan.installDir, "server/main.ts"))) fail("Cannot identify the package launcher's server child; refusing to stop its restart loop");
           if (children.length === 1) {
