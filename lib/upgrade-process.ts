@@ -866,33 +866,38 @@ export async function stopUpgradeProcess(plan: UpgradeProcess): Promise<void> {
       await verifyLoop(sup);
       const rows = await listProcesses();
       if (pid !== null && !descendants(rows, sup.pid, false).includes(pid)) fail(`Process ${pid} is not run by the inspected restart loop; refusing to stop it`);
-      let serverChild: UpgradeProcess | undefined;
-      if (pid !== null && plan.role === "server" && runsInstallScript(plan.args, plan.installDir, "bin/omp-web.js")) {
-        const children = rows.filter((row) => row.ppid === pid && row.state !== "Z" && belongsToInstall(row, plan.installDir) && !isHostCommand(row.args));
-        if (children.length > 1 || children.some((row) => !runsInstallScript(row.args, plan.installDir, "server/main.ts"))) fail("Cannot identify the package launcher's server child; refusing to stop its restart loop");
-        if (children.length === 1) {
-          const child = children[0], identity = await processStartIdentity(child.pid);
-          if (!identity) fail("Cannot verify the package launcher's server child");
-          serverChild = { ...plan, pid: child.pid, identity, executable: child.exe, args: child.args, supervisor: { kind: "foreground" }, current: { pid: child.pid, identity } };
-        }
-      }
       await signalProcess(sup.pid, "SIGSTOP");
-      let launcherFrozen = false;
+      let launcherFrozen = false, stopStarted = false;
       try {
-        if (serverChild && pid !== null) {
+        if (pid !== null && plan.role === "server" && runsInstallScript(plan.args, plan.installDir, "bin/omp-web.js")) {
           if (await runningInstance(plan) !== pid) fail("The package launcher exited before its server child could be stopped");
-          // Hold the launcher so its child's graceful exit cannot turn into exit 0 for the restart loop.
+          // Freeze before discovery: a launcher waiting for its port can still spawn a child.
           await signalProcess(pid, "SIGSTOP");
           launcherFrozen = true;
-          await stopUpgradeProcess(serverChild);
+          const children = (await listProcesses()).filter((row) => row.ppid === pid && row.state !== "Z" && belongsToInstall(row, plan.installDir) && !isHostCommand(row.args));
+          if (children.length > 1 || children.some((row) => !runsInstallScript(row.args, plan.installDir, "server/main.ts"))) fail("Cannot identify the package launcher's server child; refusing to stop its restart loop");
+          if (children.length === 1) {
+            const child = children[0], identity = await processStartIdentity(child.pid);
+            if (!identity) fail("Cannot verify the package launcher's server child");
+            const serverChild: UpgradeProcess = { ...plan, pid: child.pid, identity, executable: child.exe, args: child.args, supervisor: { kind: "foreground" }, current: { pid: child.pid, identity } };
+            // Hold the launcher so its child's graceful exit cannot turn into exit 0 for the restart loop.
+            stopStarted = true;
+            await stopUpgradeProcess(serverChild);
+          }
         }
         // SIGTERM would make the daemon exit 0, and the loop (README: exit 0 = stopped on purpose) would then end instead of restarting it.
-        if (pid !== null) { await signalProcess(pid, "SIGKILL"); await waitStopped(pid); }
+        if (pid !== null) { stopStarted = true; await signalProcess(pid, "SIGKILL"); await waitStopped(pid); }
       } catch (error) {
-        if (launcherFrozen || (error as NodeJS.ErrnoException).code === "stop_pending") {
+        if (stopStarted || (error as NodeJS.ErrnoException).code === "stop_pending") {
           throw Object.assign(error instanceof Error ? error : new Error(String(error)), { code: "stop_pending" });
         }
-        await signalProcess(sup.pid, "SIGCONT").catch(() => undefined);
+        try {
+          if (launcherFrozen && pid !== null && await runningInstance(plan) === pid) await signalProcess(pid, "SIGCONT");
+          await verifyLoop(sup);
+          await signalProcess(sup.pid, "SIGCONT");
+        } catch (resumeError) {
+          throw Object.assign(resumeError instanceof Error ? resumeError : new Error(String(resumeError)), { code: "stop_pending" });
+        }
         throw error;
       }
       return;

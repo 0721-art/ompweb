@@ -13,7 +13,7 @@ import { assertUpgradeProcessControl, inspectUpgradeProcess, launchDetachedUpgra
 import { processStartIdentity, isProcessAlive } from "../process-identity";
 import { isRecord } from "../type-guards";
 import type { ApprovedReleasePin, HostSoftwareUpdate, HostUpdateBlocker, HostUpdateCompatibility, HostUpdateInfo, HostUpdateOperation, HostUpdateRequest, HostUpdateTarget } from "./update-types";
-import { assertOwnedPath, ensureHostUpdateRoot, fetchHostUpdateBytes, finishHostUpdate, HOST_INSTALL_SHARED, HOST_VERSION_PATTERN, hostLaunch, hostReleaseName, hostUpdateRoot, installedHostVersionMatches, pruneHostUpdateArtifacts, readHostUpdateState, sharedHostInstallReason, validateApprovedReleasePin, writeHostUpdateDecision, writeHostUpdateJson, type HostUpdateDescriptor } from "./update-worker";
+import { assertOwnedPath, ensureHostUpdateRoot, fetchHostUpdateBytes, finishHostUpdate, HOST_INSTALL_SHARED, HOST_VERSION_PATTERN, hostLaunch, hostReleaseName, hostUpdateRoot, installedHostVersionMatches, pruneHostUpdateArtifacts, readHostUpdateState, requireHostUpdateRecovery, sharedHostInstallReason, validateApprovedReleasePin, writeHostUpdateDecision, writeHostUpdateJson, type HostUpdateDescriptor } from "./update-worker";
 
 // Covers an ordinary worker's 15 min release download plus preflight, stop and restart; coordinated prepared/committing workers remain governed by liveness.
 const LEASE_MS = 30 * 60 * 1000;
@@ -46,7 +46,8 @@ export function getHostUpdateOperation(): HostUpdateOperation | null {
   if (!state) return null;
   if (state.operation.recoveryRequired) return state.operation;
   if (state.operation.state === "running" && ((Date.now() - state.startedAt > LEASE_MS && state.operation.prepared !== true && state.operation.committing !== true) || (Date.now() - state.startedAt > 30000 && !isProcessAlive(state.workerPid ?? state.daemonPid)))) {
-    finishHostUpdate(state.operation.id, "Host update was interrupted before completion");
+    if (state.operation.committing === true) requireHostUpdateRecovery(state.operation.id, "Host update was interrupted during commit; recovery is required");
+    else finishHostUpdate(state.operation.id, "Host update was interrupted before completion");
     return readHostUpdateState()!.operation;
   }
   return state.operation;
