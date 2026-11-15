@@ -1714,7 +1714,7 @@ export async function getHostSoftwareUpdates(id: string, force = false, compatib
   if (releasePin) releasePin = validateApprovedReleasePin(releasePin);
   const current = updateCompatibility();
   const targetCompatibility = compatibility.min === current.min && compatibility.max === current.max ? {} : { targetCompatibility: compatibility };
-  const result = await requestHostUpdate(id, "checkUpdates", { compatibility: current, force, ...targetCompatibility });
+  const result = await requestHostUpdate(id, "checkUpdates", { compatibility: current, force, ...targetCompatibility, ...(releasePin ? { releasePin } : {}) });
   if (!isRecord(result) || !softwareUpdate(result.ompweb) || !isRecord(result.omp) || !nullableString(result.omp.currentVersion)
     || !["npm", "bun", "binary"].includes(String(result.ompweb.installMethod))
     || !(result.ompweb.protocolVersion === null || (Number.isSafeInteger(result.ompweb.protocolVersion) && Number(result.ompweb.protocolVersion) > 0))
@@ -1724,7 +1724,7 @@ export async function getHostSoftwareUpdates(id: string, force = false, compatib
   // A daemon from before omp updated with ompweb reports a full update status for omp: keep only its version.
   const info = { ...result, omp: { currentVersion: result.omp.currentVersion } } as unknown as HostUpdateInfo;
   const protocol = info.ompweb.protocolVersion;
-  if (info.ompweb.updateAvailable && (protocol === null || protocol < compatibility.min || protocol > compatibility.max)) {
+  if ((!releasePin || info.ompweb.supportsReleasePin === true) && info.ompweb.updateAvailable && (protocol === null || protocol < compatibility.min || protocol > compatibility.max)) {
     return { ...info, ompweb: { ...info.ompweb, canUpdate: false, canForceUpdate: false, blockedReason: protocol === null
       ? "The target release's link protocol could not be verified. Update is blocked."
       : `Update ompweb on this server first: this host update uses link protocol v${protocol}; the server supports v${compatibility.min}–v${compatibility.max}.` } };
@@ -1743,7 +1743,7 @@ export async function getHostSoftwareUpdates(id: string, force = false, compatib
     if (id === LOCAL_HOST_ID) {
       // This machine's daemon is recovered through its private control endpoint, never through its runner or a downloaded helper.
       try {
-        await checkHostRecovery({ version: info.ompweb.availableVersion ?? "", compatibility });
+        await checkHostRecovery({ version: releasePin?.version ?? info.ompweb.availableVersion ?? "", compatibility });
         info.ompweb.canForceUpdate = true;
         info.ompweb.forceMethod = "recovery";
       } catch (error) {
@@ -1800,11 +1800,12 @@ export async function updateHostSoftware(id: string, target: HostUpdateTarget, v
     return { accepted: true, operation: checked.operation! };
   }
   const candidate = checked[target];
-  if (!matching && (!candidate.updateAvailable || !(options.force ? candidate.canForceUpdate || candidate.canUpdate : candidate.canUpdate) || candidate.availableVersion !== version)) {
-    throw new HostOpError(409, "host_update_blocked", candidate.blockedReason ?? "The available version changed; check for updates again");
-  }
   const link = linkFor(id);
   const recovery = candidate.forceMethod === "recovery" || options.phase !== undefined && candidate.supportsTwoPhaseUpdate !== true;
+  const pinnedRecovery = options.releasePin !== undefined && recovery;
+  if (!matching && (!candidate.updateAvailable || !(options.force ? candidate.canForceUpdate || candidate.canUpdate : candidate.canUpdate) || candidate.availableVersion !== version && !pinnedRecovery)) {
+    throw new HostOpError(409, "host_update_blocked", candidate.blockedReason ?? "The available version changed; check for updates again");
+  }
   if (recovery && !options.force) throw new HostOpError(409, "host_update_blocked", "This host requires explicitly approved recovery");
   if (options.force && recovery && id === LOCAL_HOST_ID) {
     try { return await startHostRecovery({ operationId: options.operationId ?? randomUUID(), version, compatibility, force: true, releasePin: options.releasePin, requireReleasePin: options.requireReleasePin, phase: options.phase }); }

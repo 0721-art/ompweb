@@ -227,9 +227,10 @@ terminate sessions and subagents; it never bypasses release digests, installatio
 ownership, process identity, service permissions or the update-disable setting.
 An unreachable incompatible host blocks a server-only cutover instead of being
 silently left behind.
-Approval pins the release artifacts, not only their version. A changed release
-requires a new plan and approval. Required service stop/start permissions are
-checked before any incompatible host moves.
+Approval pins the selected release and its artifacts. Changing either requires
+a new plan and approval; a later registry `latest` does not replace an approved
+target. Required service stop/start permissions are checked before any
+incompatible host moves.
 
 **Settings → Hosts** retains per-host Update and offers **Force update** when a
 verified recovery path is available. For old daemons without the maintenance API,

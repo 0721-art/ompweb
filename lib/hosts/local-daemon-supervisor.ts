@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, win32 } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -107,6 +107,35 @@ function normal(value: string, platform: NodeJS.Platform): string {
   return platform === "win32" ? value.replaceAll("/", "\\").toLowerCase() : value;
 }
 
+function commandArguments(command: string, platform: NodeJS.Platform): string[] {
+  const args: string[] = [];
+  let current = "", quote = "";
+  for (let index = 0; index < command.length; index++) {
+    const character = command[index];
+    if (quote) {
+      if (character === quote) quote = "";
+      else if (character === "\\" && platform !== "win32" && /[\s'"\\]/.test(command[index + 1] ?? "")) current += command[++index];
+      else current += character;
+    } else if (character === "'" || character === "\"") quote = character;
+    else if (/\s/.test(character)) {
+      if (current) { args.push(current); current = ""; }
+    } else if (character === ";") break;
+    else if (character === "\\" && platform !== "win32" && /[\s'"\\]/.test(command[index + 1] ?? "")) current += command[++index];
+    else current += character;
+  }
+  if (current) args.push(current);
+  return args;
+}
+
+function configuredCommands(text: string, platform: NodeJS.Platform): string[][] {
+  return [...text.matchAll(/^(?:ExecStart=|\s*exec\s+)(.+)$/gm)].map((match) => commandArguments(match[1].trim(), platform));
+}
+
+function systemdCommand(execStart: string | undefined, platform: NodeJS.Platform): string[] {
+  const argv = execStart?.match(/\bargv\[\]=(.*?)\s+;/)?.[1];
+  return argv ? commandArguments(argv, platform) : [];
+}
+
 /** Finds native supervisors proven to target this installation or agent. Absence is distinct from an inspection failure. */
 export async function inspectInstalledHostSupervisor(options: SupervisorInspectionOptions = {}): Promise<InstalledHostSupervisor | null> {
   const platform = options.platform ?? process.platform;
@@ -116,14 +145,22 @@ export async function inspectInstalledHostSupervisor(options: SupervisorInspecti
     ? { ...env, XDG_RUNTIME_DIR: join(options.root ?? "/", "run", "user", String(options.uid ?? process.getuid!())) }
     : env;
   const run = options.run ?? ((command, args) => runNative(command, args, commandEnv));
-  const pathApi = platform === "win32" ? win32 : { join, resolve };
+  const pathApi = platform === "win32" ? win32 : { basename, isAbsolute, join, relative, resolve, sep };
   const agentDir = pathApi.resolve(env.PI_CODING_AGENT_DIR ?? pathApi.join(home, ".omp", "agent"));
   const defaultAgentDir = pathApi.resolve(pathApi.join(home, ".omp", "agent"));
   const installDir = pathApi.resolve(env.OMP_WEB_PACKAGE_DIR ?? process.cwd());
-  const target = (text: string) => {
-    const value = normal(text, platform);
-    return value.includes(normal(agentDir, platform)) || value.includes(normal(installDir, platform));
+  const inside = (value: string, directory: string) => {
+    if (!pathApi.isAbsolute(value)) return false;
+    const child = pathApi.relative(normal(directory, platform), normal(value, platform));
+    return child === "" || (child !== ".." && !child.startsWith(`..${pathApi.sep}`) && !pathApi.isAbsolute(child));
   };
+  const ownedPath = (value: string) => inside(value, agentDir) || inside(value, installDir);
+  const ownsCommand = (args: string[]) => args.some(ownedPath);
+  const hostCommand = (args: string[]) => args.some((argument, index) => {
+    const name = normal(pathApi.basename(argument), platform);
+    if (ownedPath(argument) && ["omp-web-host.js", "omp-web-host.ps1", "ompweb-host.ps1"].includes(name)) return true;
+    return ["ompweb", "ompweb.exe", "omp-web.js"].includes(name) && args[index + 1] === "host";
+  });
   const root = options.root ?? "/";
   const uid = options.uid ?? process.getuid?.();
   const managerAvailable = options.managerAvailable ?? (async (user: boolean) => {
@@ -146,14 +183,25 @@ export async function inspectInstalledHostSupervisor(options: SupervisorInspecti
       const shown = records(await run("systemctl", [...prefix, "show", ...units, "--property=Id", "--property=LoadState", "--property=FragmentPath", "--property=ExecStart", "--property=Environment"]));
       for (const record of shown) {
         if (record.LoadState !== "loaded" || !record.FragmentPath || !record.Id) continue;
-        const ownershipEnvironment = (record.Environment ?? "").split(/\s+/).filter((entry) => /^(?:PI_CODING_AGENT_DIR|OMP_WEB_PACKAGE_DIR)=/.test(entry)).join("\n");
-        let text = [record.Id, record.FragmentPath, record.ExecStart, ownershipEnvironment].join("\n");
+        const environmentPaths = commandArguments(record.Environment ?? "", platform).flatMap((entry) => {
+          const match = entry.match(/^(?:PI_CODING_AGENT_DIR|OMP_WEB_PACKAGE_DIR)=(.+)$/);
+          return match ? [match[1]] : [];
+        });
         const exactUserUnit = user && record.Id === SYSTEMD_UNIT && resolve(record.FragmentPath) === resolve(join(home, ".config", "systemd", "user", SYSTEMD_UNIT));
-        const program = record.ExecStart?.match(/path=(.*?)\s+;/)?.[1];
-        if (program) text += `\n${await smallTextFile(program, target(text))}`;
-        if (target(text)) text += `\n${await fs.readFile(record.FragmentPath, "utf8")}`;
         const defaultExact = exactUserUnit && agentDir === defaultAgentDir;
-        if ((target(text) || defaultExact) && /\bhost\b/i.test(text)) found.push({ record, user });
+        const commands = [systemdCommand(record.ExecStart, platform)].filter((args) => args.length > 0);
+        let ownershipKnown = environmentPaths.some(ownedPath) || commands.some(ownsCommand);
+        const program = commands[0]?.[0];
+        if (program && (commands[0].length === 1 || ownedPath(program))) {
+          const wrapper = await smallTextFile(program, ownershipKnown);
+          commands.push(...configuredCommands(wrapper, platform));
+          ownershipKnown ||= commands.some(ownsCommand);
+        }
+        if (ownershipKnown || defaultExact) {
+          commands.push(...configuredCommands(await fs.readFile(record.FragmentPath, "utf8"), platform));
+          ownershipKnown ||= commands.some(ownsCommand);
+        }
+        if ((ownershipKnown || defaultExact) && commands.some(hostCommand)) found.push({ record, user });
       }
     }
     if (found.length > 1) throw new Error("More than one native systemd service targets this local host; refusing unmanaged startup");
@@ -162,7 +210,7 @@ export async function inspectInstalledHostSupervisor(options: SupervisorInspecti
     const exactPath = join(home, ".config", "systemd", "user", SYSTEMD_UNIT);
     if (user && record.Id === SYSTEMD_UNIT && resolve(record.FragmentPath!) === resolve(exactPath)) {
       const unit = await trustedFile(exactPath);
-      if (!/^ExecStart=.*\shost\s*$/m.test(unit)) throw new Error(`Installed native host supervisor ${exactPath} could not be verified`);
+      if (!configuredCommands(unit, platform).some(hostCommand)) throw new Error(`Installed native host supervisor ${exactPath} could not be verified`);
       return {
         description: `systemd user unit ${SYSTEMD_UNIT}`,
         start: async () => { await run("systemctl", ["--user", "start", SYSTEMD_UNIT]); },
@@ -192,14 +240,17 @@ export async function inspectInstalledHostSupervisor(options: SupervisorInspecti
         const program = contents.match(/<key>Program<\/key>\s*<string>([\s\S]*?)<\/string>/)?.[1];
         if (program) argumentsList.unshift(xmlValue(program));
         const environment = contents.match(/<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/)?.[1] ?? "";
-        const ownershipEnvironment = [...environment.matchAll(/<key>(?:PI_CODING_AGENT_DIR|OMP_WEB_PACKAGE_DIR)<\/key>\s*<string>([\s\S]*?)<\/string>/g)].map((match) => xmlValue(match[1])).join("\n");
-        let evidence = `${label}\n${argumentsList.join("\n")}\n${ownershipEnvironment}`;
-        const ownershipKnown = target(evidence);
+        const ownershipEnvironment = [...environment.matchAll(/<key>(?:PI_CODING_AGENT_DIR|OMP_WEB_PACKAGE_DIR)<\/key>\s*<string>([\s\S]*?)<\/string>/g)].map((match) => xmlValue(match[1]));
+        const commands = [argumentsList];
+        let ownershipKnown = ownershipEnvironment.some(ownedPath) || ownsCommand(argumentsList);
         for (const [index, argument] of argumentsList.entries()) {
-          if (argument.startsWith("/") && (index === 0 || /\.(?:sh|command|js|mjs|cjs|py|pl|rb)$/i.test(argument))) evidence += `\n${await smallTextFile(argument, ownershipKnown)}`;
+          if ((argument.startsWith("/") || pathApi.isAbsolute(argument)) && (index === 0 || /\.(?:sh|command|js|mjs|cjs|py|pl|rb)$/i.test(argument))) {
+            commands.push(...configuredCommands(await smallTextFile(argument, ownershipKnown), platform));
+          }
         }
+        ownershipKnown ||= commands.some(ownsCommand);
         const defaultExact = location.controllable && label === LAUNCHD_LABEL && agentDir === defaultAgentDir;
-        if ((target(evidence) || defaultExact) && /\bhost\b/i.test(evidence)) found.push({ path, label, domain: location.domain, controllable: location.controllable, contents });
+        if ((ownershipKnown || defaultExact) && commands.some(hostCommand)) found.push({ path, label, domain: location.domain, controllable: location.controllable, contents });
       }
     }
     if (found.length > 1) throw new Error("More than one native launchd job targets this local host; refusing unmanaged startup");
@@ -232,13 +283,18 @@ export async function inspectInstalledHostSupervisor(options: SupervisorInspecti
     const currentUser = normal(inventory.user, platform);
     const recognizedTasks = inventory.tasks.filter((task) => {
       if (normal(task.userId, platform) !== currentUser || !Array.isArray(task.actions) || task.actions.length !== 1) return false;
-      const action = `${task.actions[0].execute} ${task.actions[0].arguments}`;
-      return target(action) && /\bhost\b/i.test(`${task.path}${task.name} ${action}`);
+      const action = task.actions[0];
+      const args = [action.execute, ...commandArguments(action.arguments, platform)];
+      const commands = [args];
+      for (let index = 0; index < args.length - 1; index++) {
+        if (/^-Command$/i.test(args[index])) commands.push(commandArguments(args[index + 1], platform));
+      }
+      return commands.some(ownsCommand) && commands.some(hostCommand);
     });
     const services = inventory.services.filter((service) => {
-      const pathName = normal(service.pathName, platform);
-      const ownsAgent = pathName.includes(normal(agentDir, platform));
-      return (normal(service.startName, platform) === currentUser || ownsAgent) && /\bhost\b/i.test(service.pathName) && target(service.pathName);
+      const args = commandArguments(service.pathName, platform);
+      const ownsAgent = args.some((argument) => inside(argument, agentDir));
+      return (normal(service.startName, platform) === currentUser || ownsAgent) && ownsCommand(args) && hostCommand(args);
     });
     if (recognizedTasks.length + services.length > 1) throw new Error("More than one native Windows supervisor targets this local host; refusing unmanaged startup");
     if (services.length === 1) return pending(`Windows service ${services[0].name}`);

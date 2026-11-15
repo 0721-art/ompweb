@@ -7,6 +7,7 @@ import { checkNpmUpdate, detectInstallMethod } from "../npm-update";
 import { getOmpVersion } from "../omp/omp-cli";
 import { createChildProcessEnvironment } from "../project-command-env";
 import { isUpdateDisabled } from "../update-policy";
+import { isNewerVersion } from "../version-compare";
 import { releaseRepo } from "../release-repo";
 import { assertUpgradeProcessControl, inspectUpgradeProcess, launchDetachedUpgrade, type UpgradeProcess } from "../upgrade-process";
 import { processStartIdentity, isProcessAlive } from "../process-identity";
@@ -14,7 +15,7 @@ import { isRecord } from "../type-guards";
 import type { ApprovedReleasePin, HostSoftwareUpdate, HostUpdateBlocker, HostUpdateCompatibility, HostUpdateInfo, HostUpdateOperation, HostUpdateRequest, HostUpdateTarget } from "./update-types";
 import { assertOwnedPath, ensureHostUpdateRoot, fetchHostUpdateBytes, finishHostUpdate, HOST_INSTALL_SHARED, HOST_VERSION_PATTERN, hostLaunch, hostReleaseName, hostUpdateRoot, installedHostVersionMatches, pruneHostUpdateArtifacts, readHostUpdateState, sharedHostInstallReason, validateApprovedReleasePin, writeHostUpdateDecision, writeHostUpdateJson, type HostUpdateDescriptor } from "./update-worker";
 
-// Covers a 15 min release download (update-worker.ts DOWNLOAD_TIMEOUT_MS) plus preflight, stop and restart.
+// Covers an ordinary worker's 15 min release download plus preflight, stop and restart; coordinated prepared/committing workers remain governed by liveness.
 const LEASE_MS = 30 * 60 * 1000;
 /** What the claim-time supervisor inspection may be reused for by status checks; a start always inspects afresh. */
 const INSPECTION_TTL_MS = 60 * 1000;
@@ -44,7 +45,7 @@ export function getHostUpdateOperation(): HostUpdateOperation | null {
   const state = readHostUpdateState();
   if (!state) return null;
   if (state.operation.recoveryRequired) return state.operation;
-  if (state.operation.state === "running" && (Date.now() - state.startedAt > LEASE_MS || (Date.now() - state.startedAt > 30000 && !isProcessAlive(state.workerPid ?? state.daemonPid)))) {
+  if (state.operation.state === "running" && ((Date.now() - state.startedAt > LEASE_MS && state.operation.prepared !== true && state.operation.committing !== true) || (Date.now() - state.startedAt > 30000 && !isProcessAlive(state.workerPid ?? state.daemonPid)))) {
     finishHostUpdate(state.operation.id, "Host update was interrupted before completion");
     return readHostUpdateState()!.operation;
   }
@@ -190,12 +191,12 @@ interface HostUpdateEvaluation {
   /** The candidate's application protocol is outside the current server's range but inside the approved target range. */
   awaitsServerCutover: boolean;
 }
-async function evaluateHostUpdate(compatibility: HostUpdateCompatibility, refresh: boolean, targetCompatibility: HostUpdateCompatibility | undefined, fresh: boolean): Promise<HostUpdateEvaluation> {
+async function evaluateHostUpdate(compatibility: HostUpdateCompatibility, refresh: boolean, targetCompatibility: HostUpdateCompatibility | undefined, fresh: boolean, targetVersion?: string): Promise<HostUpdateEvaluation> {
   assertCompatibility(compatibility);
   if (targetCompatibility !== undefined) assertCompatibility(targetCompatibility);
   const operation = getHostUpdateOperation();
   const disabled = isUpdateDisabled() ? "Updates are disabled by OMP_WEB_DISABLE_AUTOUPDATE" : null;
-  const [npm, ompVersion] = await Promise.all([checkNpmUpdate(refresh).catch(() => null), getOmpVersion()]);
+  const [npm, ompVersion] = await Promise.all([targetVersion === undefined ? checkNpmUpdate(refresh).catch(() => null) : { currentVersion: packageJson.version, availableVersion: targetVersion, updateAvailable: isNewerVersion(targetVersion, packageJson.version) }, getOmpVersion()]);
   const base: HostSoftwareUpdate = { currentVersion: null, availableVersion: null, updateAvailable: false, canUpdate: false, blockers: [], canForceUpdate: false, blockedReason: null, updateCommand: "" };
   base.supportsReleasePin = true;
   base.supportsTwoPhaseUpdate = true;
@@ -232,9 +233,10 @@ async function evaluateHostUpdate(compatibility: HostUpdateCompatibility, refres
   return { info: { ompweb, omp: runtime, operation }, plan, awaitsServerCutover };
 }
 
-/** `refresh` bypasses the registry and protocol caches (the existing meaning of the request's `force` for a check, not the update force). `targetCompatibility`: see HostUpdateRequest. */
-export async function checkHostUpdates(compatibility: HostUpdateCompatibility, refresh = false, targetCompatibility?: HostUpdateCompatibility): Promise<HostUpdateInfo> {
-  return (await evaluateHostUpdate(compatibility, refresh, targetCompatibility, false)).info;
+/** `refresh` bypasses the registry and protocol caches (the existing meaning of the request's `force` for a check, not the update force). An approved pin evaluates its immutable version instead of the moving registry latest. */
+export async function checkHostUpdates(compatibility: HostUpdateCompatibility, refresh = false, targetCompatibility?: HostUpdateCompatibility, releasePin?: ApprovedReleasePin): Promise<HostUpdateInfo> {
+  const targetVersion = releasePin === undefined ? undefined : validateApprovedReleasePin(releasePin, undefined, releaseRepo()).version;
+  return (await evaluateHostUpdate(compatibility, refresh, targetCompatibility, false, targetVersion)).info;
 }
 
 const inProgress = () => new HostUpdateError("update_in_progress", "Another host update is in progress");
@@ -402,7 +404,7 @@ export async function startHostUpdate(target: HostUpdateTarget, version: string,
   const root = claimHostUpdate(id);
   let claimed = false;
   try {
-    const { info, plan, awaitsServerCutover } = await evaluateHostUpdate(compatibility, true, request.targetCompatibility, true);
+    const { info, plan, awaitsServerCutover } = await evaluateHostUpdate(compatibility, true, request.targetCompatibility, true, releasePin?.version);
     const software = info[target];
     if (!software.updateAvailable || software.availableVersion !== version) throw new HostUpdateError("candidate_changed", "The available update candidate changed; refresh host updates");
     if (!software.canUpdate && !(force && software.canForceUpdate)) throw new HostUpdateError(software.canForceUpdate ? "host_busy" : "update_blocked", software.blockedReason || "This host update is blocked");

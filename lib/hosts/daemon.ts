@@ -459,9 +459,11 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
       }
       case "sessionFileExists": return localHost.sessionFileExists(sessionsPath(args.path));
       case "invalidateSessionLists": invalidateWorkspaceRoots(); localHost.invalidateSessionLists(args.path === undefined ? undefined : sessionsPath(args.path)); sessionsChanged(); return;
-      case "checkUpdates":
+      case "checkUpdates": {
         if (args.force !== undefined && typeof args.force !== "boolean") throw new HostOpError(400, "invalid_request", "force must be a boolean");
-        return checkHostUpdates(updateCompatibility(args.compatibility), args.force === true, args.targetCompatibility === undefined ? undefined : updateCompatibility(args.targetCompatibility));
+        const releasePin = args.releasePin === undefined ? undefined : validateApprovedReleasePin(args.releasePin);
+        return checkHostUpdates(updateCompatibility(args.compatibility), args.force === true, args.targetCompatibility === undefined ? undefined : updateCompatibility(args.targetCompatibility), releasePin);
+      }
       case "updateSoftware":
         if (args.target !== "ompweb" || typeof args.version !== "string") throw new HostOpError(400, "invalid_request", "Invalid host update");
         return startHostUpdate(args.target, args.version, updateCompatibility(args.compatibility), updateRequest(args));

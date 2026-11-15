@@ -17,6 +17,8 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 - **Coordinated upgrades stage every participant before committing.** A later host's download or preflight failure leaves earlier hosts on their existing release. Approval inventory is rechecked before host commits and server cutover. Native supervisor discovery prevents slow managed startup from being replaced by an unmanaged daemon, and macOS system LaunchDaemons retain their actual supervisor identity.
 - **Exited foreground hosts no longer reserve recycled process IDs during an update.** A confirmed exit retires only that instance; unreadable liveness remains an error, and uncertainty after a stop signal retains the recovery fence.
 - **Package servers supervised by a shell restart loop stop their server child before replacing the launcher.** The loop restarts the correct launcher, the old server releases its port, and independent host daemons keep running.
+- **Approved host updates keep their selected release and operation ownership.** A newer published release does not block pinned admission. Commit decisions become visible only when complete, and active prepared or committing workers retain their update claims past the preparation deadline.
+- **Local-host startup ignores unrelated services.** Installation paths match at directory boundaries, and daemon detection distinguishes the host subcommand from directory names or server argument values.
 
 ## [v0.7.1] - 2026-11-14
 

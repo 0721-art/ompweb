@@ -1,7 +1,7 @@
 // Old daemons copy only this file. Keep its startup Node-only and load lifecycle code before any swap, from private copies or the descriptor's verified installation.
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmodSync, closeSync, createReadStream, createWriteStream, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, createReadStream, createWriteStream, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createGunzip, inflateRawSync } from "node:zlib";
@@ -158,11 +158,13 @@ export function writeHostUpdateDecision(id: string, decision: HostUpdateDecision
   }
   if (state.operation.state !== "running" || decision === "commit" && state.operation.prepared !== true) throw new Error("Host update operation is not prepared");
   const marker = join(root, id, "decision.json");
-  try { writeFileSync(marker, JSON.stringify({ id, version: descriptor.version, decision }), { flag: "wx", mode: 0o600 }); }
+  const temporary = `${marker}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, JSON.stringify({ id, version: descriptor.version, decision }), { flag: "wx", mode: 0o600 });
+  try { linkSync(temporary, marker); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     if (readHostUpdateDecision(descriptor) !== decision) throw new Error("Host update operation already has a different decision");
-  }
+  } finally { rmSync(temporary, { force: true }); }
   return state.operation;
 }
 export function readHostUpdateState(): HostUpdateStoredState | null {
