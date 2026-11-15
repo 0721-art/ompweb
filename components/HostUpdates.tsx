@@ -7,6 +7,7 @@ import type { HostRow } from "@/lib/hosts/hub";
 import type { HostUpdateInfo, HostUpdateOperation, HostUpdateTarget } from "@/lib/hosts/update-types";
 import { useI18n } from "@/lib/i18n";
 import { hostName } from "./host-status";
+import { HostUpdateChannel } from "./HostUpdateChannel";
 
 const buttonStyle = { padding: "6px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "transparent", color: "var(--text)", fontSize: 12, display: "inline-flex", alignItems: "center", gap: 5 } as const;
 const POLL_MS = 1000;
@@ -175,6 +176,11 @@ export function HostUpdates({ host }: { host: HostRow }) {
           <RefreshCw size={13} aria-hidden="true" />{t(loading ? "hostUpdates.checking" : error || needsStatus ? "hostUpdates.retry" : "hostUpdates.check")}
         </button>
       </div>
+      {info?.settings && <HostUpdateChannel key={host.id} endpoint={endpoint} settings={info.settings} disabled={disabled || needsStatus} onPendingChange={setPosting} onSaved={(settings) => {
+        setConfirm(null);
+        setInfo((previous) => previous && { ...previous, settings, ompweb: { ...previous.ompweb, availableVersion: null, updateAvailable: false, canUpdate: false } });
+        setCheck((value) => value + 1);
+      }} />}
       {(["ompweb"] as const).map((target) => {
         const software = info?.[target];
         const label = t(`hostUpdates.${target}`);

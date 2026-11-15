@@ -8,6 +8,7 @@ import { createGunzip, inflateRawSync } from "node:zlib";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import type { HostUpdateOperation, HostUpdateTarget } from "./update-types";
+import { githubFetch } from "../github-fetch";
 
 import { setTimeout as pause } from "node:timers/promises";
 const exec = promisify(execFile);
@@ -19,7 +20,16 @@ export const HOST_RELEASE_MAX_EXPANDED = 1024 * 1024 * 1024;
 export const HOST_RELEASE_MAX_MEMBER = 512 * 1024 * 1024;
 /** The whole release download (or npm install): 512 MiB in 15 min needs about 5 Mbit/s. */
 const DOWNLOAD_TIMEOUT_MS = 15 * 60 * 1000;
-export const HOST_VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/;
+export const HOST_VERSION_PATTERN = /^(?:(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?|\d{8}T\d{6}Z-[a-f0-9]{10})$/;
+const PRERELEASE_VERSION = /^(\d{8}T\d{6}Z)-([a-f0-9]{10})$/;
+function validPrereleaseStamp(version: string): boolean {
+  const match = PRERELEASE_VERSION.exec(version);
+  if (!match) return false;
+  const stamp = match[1];
+  const iso = `${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 8)}T${stamp.slice(9, 11)}:${stamp.slice(11, 13)}:${stamp.slice(13, 15)}.000Z`;
+  const time = Date.parse(iso);
+  return Number.isFinite(time) && new Date(time).toISOString() === iso;
+}
 
 export interface HostUpdateStoredState {
   operation: HostUpdateOperation;
@@ -42,6 +52,11 @@ export interface HostUpdateDescriptor {
   daemonIdentity?: string | null;
   managerPath?: string;
   restartOnly?: boolean;
+  channel?: "stable" | "prerelease";
+  releaseTag?: string;
+  releaseSha?: string;
+  /** In-memory server staging only. Host workers receive this through OMP_WEB_UPDATE_GITHUB_TOKEN. */
+  token?: string;
   systemd: { unit: string; user: boolean } | null;
   /** Binary release source; absent only on a legacy restart-only descriptor, which downloads nothing. */
   releaseRepo?: string;
@@ -126,11 +141,11 @@ export function finishHostUpdate(id: string, error?: string): void {
   }
 }
 
-async function readHostUpdate(url: string, maxBytes: number, timeout: number, onChunk: (chunk: Uint8Array) => void): Promise<void> {
+async function readHostUpdate(url: string, maxBytes: number, timeout: number, onChunk: (chunk: Uint8Array) => void, token?: string): Promise<void> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    const response = await fetch(url, { signal: controller.signal, cache: "no-store", headers: { "User-Agent": "ompweb-host-updater" } });
+    const response = await githubFetch(url, { signal: controller.signal, cache: "no-store", headers: { "User-Agent": "ompweb-host-updater" } }, token ?? process.env.OMP_WEB_UPDATE_GITHUB_TOKEN);
     if (!response.ok || !response.body) throw new Error(`Release request failed (${response.status})`);
     if (response.url && (!response.url.startsWith("https://") || !["raw.githubusercontent.com", "api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"].includes(new URL(response.url).hostname))) throw new Error("Unexpected release download destination");
     if (Number(response.headers.get("content-length")) > maxBytes) throw new Error("Release response is too large");
@@ -147,16 +162,16 @@ async function readHostUpdate(url: string, maxBytes: number, timeout: number, on
     } catch (error) { await reader.cancel().catch(() => {}); throw error; }
   } finally { clearTimeout(timer); }
 }
-export async function fetchHostUpdateBytes(url: string, maxBytes: number, timeout = 5000): Promise<Buffer> {
+export async function fetchHostUpdateBytes(url: string, maxBytes: number, timeout = 5000, token?: string): Promise<Buffer> {
   const chunks: Uint8Array[] = [];
-  await readHostUpdate(url, maxBytes, timeout, (chunk) => { chunks.push(chunk); });
+  await readHostUpdate(url, maxBytes, timeout, (chunk) => { chunks.push(chunk); }, token);
   return Buffer.concat(chunks);
 }
 /** Streams the response into a new `file` (never whole in memory); returns its `sha256:<hex>` digest. */
-export async function downloadHostUpdateFile(url: string, file: string, maxBytes: number, timeout = DOWNLOAD_TIMEOUT_MS): Promise<string> {
+export async function downloadHostUpdateFile(url: string, file: string, maxBytes: number, timeout = DOWNLOAD_TIMEOUT_MS, token?: string): Promise<string> {
   const hash = createHash("sha256");
   const fd = openSync(file, "wx", 0o600);
-  try { await readHostUpdate(url, maxBytes, timeout, (chunk) => { writeSync(fd, chunk); hash.update(chunk); }); }
+  try { await readHostUpdate(url, maxBytes, timeout, (chunk) => { writeSync(fd, chunk); hash.update(chunk); }, token); }
   finally { closeSync(fd); }
   return `sha256:${hash.digest("hex")}`;
 }
@@ -291,14 +306,21 @@ export async function extractHostReleaseArchive(archive: string, root: string, s
   }
 }
 
-async function stageBinary(d: HostUpdateDescriptor, staging: string): Promise<string> {
+export async function stageBinary(d: Pick<HostUpdateDescriptor, "version" | "channel" | "releaseRepo" | "releaseTag" | "releaseSha" | "token">, staging: string): Promise<string> {
   const name = hostReleaseName();
   const assetName = `${name}${process.platform === "win32" ? ".zip" : ".tar.gz"}`;
-  const metadata = JSON.parse((await fetchHostUpdateBytes(`https://api.github.com/repos/${d.releaseRepo}/releases/tags/v${d.version}`, 2 * 1024 * 1024)).toString("utf8")) as { tag_name?: string; assets?: { name: string; digest?: string }[] };
+  const prerelease = PRERELEASE_VERSION.exec(d.version);
+  const tag = d.releaseTag ?? (prerelease ? d.version : `v${d.version}`);
+  if (!d.releaseRepo || !/^[\w.-]+\/[\w.-]+$/.test(d.releaseRepo)
+    || !HOST_VERSION_PATTERN.test(d.version) || tag !== (prerelease ? d.version : `v${d.version}`)
+    || prerelease && (!validPrereleaseStamp(d.version) || d.channel !== "prerelease" || !/^[a-f0-9]{40}$/.test(d.releaseSha ?? "") || !d.releaseSha!.startsWith(prerelease[2]))) {
+    throw new Error("Invalid binary release tag or commit");
+  }
+  const metadata = JSON.parse((await fetchHostUpdateBytes(`https://api.github.com/repos/${d.releaseRepo}/releases/tags/${encodeURIComponent(tag)}`, 2 * 1024 * 1024, 5000, d.token)).toString("utf8")) as { tag_name?: string; assets?: { name: string; digest?: string }[] };
   const asset = metadata.assets?.find((item) => item.name === assetName);
-  if (metadata.tag_name !== `v${d.version}` || !asset?.digest || !/^sha256:[a-f0-9]{64}$/.test(asset.digest)) throw new Error("Official release asset digest is unavailable");
+  if (metadata.tag_name !== tag || !asset?.digest || !/^sha256:[a-f0-9]{64}$/.test(asset.digest)) throw new Error("Official release asset digest is unavailable");
   const download = join(staging, assetName);
-  if (await downloadHostUpdateFile(`https://github.com/${d.releaseRepo}/releases/download/v${d.version}/${assetName}`, download, HOST_RELEASE_MAX_ARCHIVE) !== asset.digest) throw new Error("Official release asset digest mismatch or unavailable");
+  if (await downloadHostUpdateFile(`https://github.com/${d.releaseRepo}/releases/download/${encodeURIComponent(tag)}/${assetName}`, download, HOST_RELEASE_MAX_ARCHIVE, DOWNLOAD_TIMEOUT_MS, d.token) !== asset.digest) throw new Error("Official release asset digest mismatch or unavailable");
   const release = join(staging, name);
   mkdirSync(release, { mode: 0o700 });
   try { await extractHostReleaseArchive(download, name, staging); } finally { rmSync(download, { force: true }); }
@@ -308,6 +330,7 @@ async function stageBinary(d: HostUpdateDescriptor, staging: string): Promise<st
   // Releases from before the runner became its own asset (preflightHostRelease fetches it otherwise) carry it here.
   const runner = join(release, process.platform === "win32" ? "ompweb-omp.exe" : "ompweb-omp");
   if (existsSync(runner)) chmodSync(runner, 0o755);
+  if (prerelease && !(await binaryContainsCommit(binary, release, d.releaseSha!))) throw new Error("Downloaded binary reports a different commit");
   if (!(await binaryReportsVersion(binary, release, d.version))) throw new Error("Downloaded host binary reports a different version");
   return release;
 }
@@ -334,7 +357,7 @@ async function stagePackage(d: HostUpdateDescriptor, staging: string): Promise<s
 }
 function workerEnvironment(additions: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env = { ...process.env, ...additions };
-  for (const name of Object.keys(env)) if (["PORT", "NODE_ENV", "OMP_WEB_PASSWORD", "OMP_WEB_PASSWORD_HASH", "OMP_WEB_TRUSTED_HEADER_SECRET", "OMP_WEB_TRUSTED_HEADER_SHA256", "OMP_WEB_PACKAGE_DIR", "OMP_WEB_LAUNCHER_PID"].includes(name.toUpperCase()) && !(name in additions)) delete env[name];
+  for (const name of Object.keys(env)) if (["PORT", "NODE_ENV", "OMP_WEB_PASSWORD", "OMP_WEB_PASSWORD_HASH", "OMP_WEB_TRUSTED_HEADER_SECRET", "OMP_WEB_TRUSTED_HEADER_SHA256", "OMP_WEB_PACKAGE_DIR", "OMP_WEB_LAUNCHER_PID", "OMP_WEB_UPDATE_GITHUB_TOKEN"].includes(name.toUpperCase()) && !(name in additions)) delete env[name];
   return env;
 }
 
@@ -396,8 +419,35 @@ export async function verifyHostServiceInstall(service: NonNullable<HostUpdateDe
   if (!valid) throw new Error("Host service restart targets a different installation or unsupported wrapper; update it manually");
 }
 
-/** `<binary> --version` printed the exact version (a leading v is allowed). */
+/** New binaries print their commit; existing builds also record it in ompweb-build.json or the client bundle. */
+async function binaryContainsCommit(binary: string, packageDir: string, sha: string): Promise<boolean> {
+  const { stdout } = await exec(binary, ["--version"], { timeout: 10000, env: workerEnvironment({ OMP_WEB_PACKAGE_DIR: packageDir }), maxBuffer: 1024 * 1024 });
+  if (stdout.match(/[a-f0-9]{40}/g)?.includes(sha)) return true;
+  try {
+    const build = JSON.parse(readFileSync(join(packageDir, "ompweb-build.json"), "utf8"));
+    if (build.sha === sha) return true;
+  } catch {}
+  try {
+    const assets = join(packageDir, "dist", "assets");
+    return readdirSync(assets).some((file) => file.endsWith(".js") && new RegExp(`["']${sha}["']`).test(readFileSync(join(assets, file), "utf8")));
+  } catch { return false; }
+}
+/** A pre-release tag identifies the build commit while its package version remains semver. */
 async function binaryReportsVersion(binary: string, packageDir: string, version: string): Promise<boolean> {
+  const prerelease = PRERELEASE_VERSION.exec(version);
+  if (prerelease) {
+    if (!validPrereleaseStamp(version)) return false;
+    try {
+      const build = JSON.parse(readFileSync(join(packageDir, "ompweb-build.json"), "utf8"));
+      if (typeof build.sha === "string" && /^[a-f0-9]{40}$/.test(build.sha) && build.sha.startsWith(prerelease[2])) return binaryContainsCommit(binary, packageDir, build.sha);
+    } catch {}
+    const { stdout } = await exec(binary, ["--version"], { timeout: 10000, env: workerEnvironment({ OMP_WEB_PACKAGE_DIR: packageDir }), maxBuffer: 1024 * 1024 });
+    if (stdout.match(/[a-f0-9]{40}/g)?.some((sha) => sha.startsWith(prerelease[2]))) return true;
+    try {
+      const assets = join(packageDir, "dist", "assets");
+      return readdirSync(assets).some((file) => file.endsWith(".js") && new RegExp(`["']${prerelease[2]}[a-f0-9]{30}["']`).test(readFileSync(join(assets, file), "utf8")));
+    } catch { return false; }
+  }
   const { stdout } = await exec(binary, ["--version"], { timeout: 10000, env: workerEnvironment({ OMP_WEB_PACKAGE_DIR: packageDir }), maxBuffer: 1024 * 1024 });
   return stdout.trim().split(/\s+/).some((token) => token.replace(/^v/, "") === version);
 }
@@ -580,7 +630,9 @@ function validateDescriptor(path: string): HostUpdateDescriptor {
   // A v10 daemon copies this new worker after the shared web installation has already been replaced.
   if (d.releaseRepo === undefined ? d.restartOnly !== true : typeof d.releaseRepo !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(d.releaseRepo)) throw new Error("Invalid host update descriptor");
   if (d.restartOnly !== undefined && typeof d.restartOnly !== "boolean") throw new Error("Invalid host restart-only descriptor");
-  if (!d.systemd && (typeof d.daemonIdentity !== "string" || !d.daemonIdentity || d.daemonIdentity.length > 200)) throw new Error("Invalid host update descriptor: the daemon's process identity is missing");
+  if ((d.channel !== undefined && !["stable", "prerelease"].includes(d.channel)) || d.token !== undefined || (d.releaseTag !== undefined && typeof d.releaseTag !== "string") || (d.releaseSha !== undefined && !/^[a-f0-9]{40}$/.test(d.releaseSha))) throw new Error("Invalid host release descriptor");
+  const prerelease = PRERELEASE_VERSION.exec(d.version);
+  if (prerelease && (!validPrereleaseStamp(d.version) || d.channel !== "prerelease" || d.installMethod !== "binary" || d.releaseTag !== d.version || !d.releaseSha?.startsWith(prerelease[2]))) throw new Error("Invalid host pre-release descriptor");
   assertOwnedPath(dirname(path), true);
   const state = readHostUpdateState();
   if (state?.operation.id !== d.id || state.operation.state !== "running" || state.operation.version !== d.version || state.daemonPid !== d.daemonPid) throw new Error("Host update descriptor does not own the running operation");

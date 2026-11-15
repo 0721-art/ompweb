@@ -9,6 +9,8 @@ const path = require("node:path");
 const cp = require("node:child_process");
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const os = require("node:os");
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const net = require("node:net");
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const STAGES = ["preparing", "stopping", "installing", "restarting", "finalizing"];
@@ -27,6 +29,13 @@ const target = arg("--target");
 const from = arg("--from");
 const launcherPid = Number(arg("--launcher-pid"));
 const serverPid = Number(arg("--server-pid"));
+const deployDescriptor = arg("--deploy-descriptor");
+const binaryDescriptor = arg("--binary-descriptor");
+let binaryRestart;
+let restartedBinary;
+const binaryEnvironment = JSON.parse(process.env.OMP_WEB_BINARY_RESTART_ENV || "{}");
+delete process.env.OMP_WEB_BINARY_RESTART_ENV;
+delete process.env.OMP_WEB_UPDATE_GITHUB_TOKEN;
 // Set when the server runs as this systemd unit; systemd stops and starts it.
 const systemdUnit = arg("--systemd-unit");
 const systemctlScope = arg("--systemd-user") === "1" ? ["--user"] : [];
@@ -93,13 +102,14 @@ function systemctl(action) {
 
 async function stopOriginalProcesses() {
   updateStatus({ stage: "stopping" });
+  if (binaryRestart) return stopOriginalBinary();
   if (systemdUnit) {
     systemctl("stop");
     return { systemd: true, launchd: false, tray: false };
   }
   // Detect services
-  const launchd = isLaunchdActive();
-  const tray = isTrayActive();
+  const launchd = !binaryDescriptor && isLaunchdActive();
+  const tray = !binaryDescriptor && isTrayActive();
   if (launchd) {
     try {
       const uid = typeof process.getuid === "function" ? process.getuid() : 501;
@@ -202,8 +212,45 @@ async function runManagerGate() {
 
 async function restartServices(info) {
   updateStatus({ stage: "restarting" });
+  if (binaryRestart && !info.systemd) {
+    let spawnError;
+    restartedBinary = cp.spawn(binaryRestart.binaryPath, binaryRestart.binaryArgs, {
+      cwd: binaryRestart.cwd,
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      env: { ...process.env, ...binaryEnvironment, OMP_WEB_PACKAGE_DIR: packageDir },
+    });
+    restartedBinary.once("error", (error) => { spawnError = error; });
+    restartedBinary.unref();
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      if (spawnError) throw spawnError;
+      if (restartedBinary.exitCode !== null || restartedBinary.signalCode !== null) throw new Error("Binary exited during startup");
+      if (await probeServer()) {
+        await sleep(500);
+        if (restartedBinary.exitCode !== null || restartedBinary.signalCode !== null) throw new Error("Binary exited during startup");
+        return;
+      }
+      await sleep(200);
+    }
+    throw new Error("Binary did not become ready within 30 seconds");
+  }
   if (info.systemd) {
     systemctl("start");
+    if (binaryRestart) {
+      const deadline = Date.now() + 30000;
+      while (Date.now() < deadline) {
+        systemctl("is-active");
+        if (await probeServer()) {
+          await sleep(500);
+          systemctl("is-active");
+          if (await probeServer()) return;
+        }
+        await sleep(200);
+      }
+      throw new Error("Binary did not become ready within 30 seconds");
+    }
     // A Type=simple start returns once the process is forked; a release that
     // crashes on startup shows up as not active a moment later.
     // shortcut: one check after 3s, not a port probe; upgrade if slow-starting crashes slip through.

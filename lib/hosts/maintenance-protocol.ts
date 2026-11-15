@@ -5,7 +5,7 @@ import { isRecord } from "../type-guards";
 
 export const MAINTENANCE_API_VERSION = 1;
 export const MAINTENANCE_PATH = "/api/hosts/maintenance";
-export const MAINTENANCE_OPS = ["status", "listSessions", "checkUpdates", "updateSoftware"] as const;
+export const MAINTENANCE_OPS = ["status", "listSessions", "checkUpdates", "updateSoftware", "getUpdateSettings", "setUpdateSettings"] as const;
 export type MaintenanceOp = (typeof MAINTENANCE_OPS)[number];
 
 /** The host's first frame. `protocolVersion` (the application link's) is advisory: nothing here depends on it. */

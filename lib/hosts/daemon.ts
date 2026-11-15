@@ -12,7 +12,7 @@ import type { HostControlCommand, HostControlStatus } from "./host-control";
 import { readHostLinks, readHostLogin, type HostLink } from "./host-login";
 import { DaemonLink, dialable, nextRedialDelay } from "./daemon-link";
 import { DaemonMaintenance } from "./daemon-maintenance";
-import { MAINTENANCE_API_VERSION, type MaintenanceOp } from "./maintenance-protocol";
+import { MAINTENANCE_API_VERSION, MAINTENANCE_OPS, type MaintenanceOp } from "./maintenance-protocol";
 import { ChannelTable } from "./daemon-channels";
 import { credentialsEnv, serverFetch, startBrokerForwarder } from "./daemon-broker";
 import { createClusterConfig } from "./daemon-cluster-config";
@@ -23,8 +23,9 @@ import { localHost, resolveSpawnCwdResult } from "./local-host";
 import { listenHostSocket, type HostSocket } from "./omp-socket";
 import { sessionOps } from "./session-ops";
 import packageJson from "../../package.json";
-import { checkHostUpdates, configureHostUpdateSafety, getHostUpdateOperation, HostUpdateError, startHostUpdate } from "./updates";
+import { checkHostUpdates, configureHostUpdateSafety, getHostUpdateOperation, HostUpdateError, saveHostUpdateSettings, startHostUpdate } from "./updates";
 import type { HostUpdateCompatibility, HostUpdateOperation } from "./update-types";
+import { isHostUpdateSettings, readHostUpdateSettings } from "./update-settings";
 import { UploadRetention } from "./upload-retention";
 import { StagedUploads, UPLOAD_SWEEP_INTERVAL_MS } from "./uploads";
 import { isWorkspaceOp, WORKSPACE_OP_PARAMS } from "../workspace-types";
@@ -307,7 +308,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
     const maintenance = new DaemonMaintenance(login, {
       hello: () => ({ type: "hello", apiVersion: MAINTENANCE_API_VERSION, protocolVersion: LINK_PROTOCOL_VERSION,
         ompwebVersion: packageJson.version, ompVersion, platform: process.platform,
-        capabilities: ["status", "listSessions", "checkUpdates", "updateSoftware"] }),
+        capabilities: [...MAINTENANCE_OPS] }),
       handleRequest: (op, args) => runMaintenance(link, op, args),
       reload: () => { reconcile(link, true); },
       log,
@@ -354,7 +355,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
       if (op === "status") return {
         apiVersion: MAINTENANCE_API_VERSION, protocolVersion: LINK_PROTOCOL_VERSION,
         ompwebVersion: packageJson.version, ompVersion, platform: process.platform,
-        capabilities: ["status", "listSessions", "checkUpdates", "updateSoftware"],
+        capabilities: [...MAINTENANCE_OPS],
         workspaceOps: Object.keys(WORKSPACE_OP_PARAMS), sessionProcesses: channels.size,
         activeTurns: channels.activeTurns, sessions: channels.maintenanceSessions(),
         drained, busyReason: busyReason(), operation: getHostUpdateOperation(),
@@ -446,10 +447,16 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
       case "invalidateSessionLists": invalidateWorkspaceRoots(); localHost.invalidateSessionLists(args.path === undefined ? undefined : sessionsPath(args.path)); sessionsChanged(); return;
       case "checkUpdates":
         if (args.force !== undefined && typeof args.force !== "boolean") throw new HostOpError(400, "invalid_request", "force must be a boolean");
-        return checkHostUpdates(updateCompatibility(args.compatibility), args.force === true);
+        if (args.githubToken !== undefined && (typeof args.githubToken !== "string" || !/^[A-Za-z0-9_]{4,255}$/.test(args.githubToken))) throw new HostOpError(400, "invalid_request", "Invalid GitHub token");
+        return checkHostUpdates(updateCompatibility(args.compatibility), args.force === true, args.githubToken as string | undefined);
       case "updateSoftware":
         if (args.target !== "ompweb" || typeof args.version !== "string") throw new HostOpError(400, "invalid_request", "Invalid host update");
-        return startHostUpdate(args.target, args.version, updateCompatibility(args.compatibility));
+        if (args.githubToken !== undefined && (typeof args.githubToken !== "string" || !/^[A-Za-z0-9_]{4,255}$/.test(args.githubToken))) throw new HostOpError(400, "invalid_request", "Invalid GitHub token");
+        return startHostUpdate(args.target, args.version, updateCompatibility(args.compatibility), args.githubToken as string | undefined);
+      case "getUpdateSettings": return readHostUpdateSettings();
+      case "setUpdateSettings":
+        if (!isHostUpdateSettings(args.settings)) throw new HostOpError(400, "invalid_request", "Invalid host update settings");
+        return saveHostUpdateSettings(args.settings);
       case "preparePoolProject": {
         if (getHostUpdateOperation()?.state === "running") throw new HostUpdateError("host_updating", "This host is updating; new project preparation must wait");
         preparationsInFlight++;

@@ -111,7 +111,7 @@ export const SESSION_OP_PARAMS: { readonly [K in keyof SessionOps]: readonly str
 };
 
 /** Unknown additions are answered with 501; pool preparation needs a v8 peer. */
-export const HOST_OP_NAMES = [...(Object.keys(SESSION_OP_PARAMS) as (keyof SessionOps)[]), ...Object.keys(WORKSPACE_OP_PARAMS) as (keyof typeof WORKSPACE_OP_PARAMS)[], "open", "close", "editLease", "sessionFileExists", "invalidateSessionLists", "checkUpdates", "updateSoftware", "uploadStart", "uploadAbort", "uploadAttach", "setUploadRetention", "clusterConfig"] as const;
+export const HOST_OP_NAMES = [...(Object.keys(SESSION_OP_PARAMS) as (keyof SessionOps)[]), ...Object.keys(WORKSPACE_OP_PARAMS) as (keyof typeof WORKSPACE_OP_PARAMS)[], "open", "close", "editLease", "sessionFileExists", "invalidateSessionLists", "checkUpdates", "updateSoftware", "getUpdateSettings", "setUpdateSettings", "uploadStart", "uploadAbort", "uploadAttach", "setUploadRetention", "clusterConfig"] as const;
 
 export type HostOpName = (typeof HOST_OP_NAMES)[number];
 

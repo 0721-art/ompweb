@@ -1,5 +1,6 @@
 import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
-import { getHostSoftwareUpdates, updateHostSoftware } from "@/lib/hosts/hub";
+import { getHostSoftwareUpdates, setHostUpdateSettings, updateHostSoftware } from "@/lib/hosts/hub";
+import { isHostUpdateSettings } from "@/lib/hosts/update-settings";
 import { HostOpError } from "@/lib/hosts/link-protocol";
 import { isApiRequestOriginAllowed, shouldCheckApiRequestOrigin } from "@/lib/request-security";
 import { isRecord } from "@/lib/type-guards";
@@ -29,11 +30,21 @@ export async function POST(request: Request, { params }: Context) {
   try {
     const body = await parseJsonWithinLimit<unknown>(request, 4096);
     if (!isRecord(body) || Object.keys(body).length !== 2 || body.target !== "ompweb"
-      || typeof body.version !== "string" || body.version.length > 100 || !/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(body.version)) {
+      || typeof body.version !== "string" || body.version.length > 100 || !/^(?:\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?|\d{8}T\d{6}Z-[a-f0-9]{10})$/.test(body.version)) {
       return fail("target and a release version are required", "invalid_host_update", 400);
     }
     return Response.json(await updateHostSoftware((await params).id, body.target, body.version), { status: 202, headers: noStore });
   } catch (error) {
     return errorResponse(error);
   }
+}
+
+export async function PATCH(request: Request, { params }: Context) {
+  if (shouldCheckApiRequestOrigin(request) && !isApiRequestOriginAllowed(request)) return fail("Cross-origin API requests are not allowed", "cross_origin_forbidden", 403);
+  if (request.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase() !== "application/json") return fail("Content-Type must be application/json", "unsupported_media_type", 415);
+  try {
+    const settings = await parseJsonWithinLimit<unknown>(request, 4096);
+    if (!isHostUpdateSettings(settings)) return fail("Invalid host update settings", "invalid_host_update_settings", 400);
+    return Response.json(await setHostUpdateSettings((await params).id, settings), { headers: noStore });
+  } catch (error) { return errorResponse(error); }
 }
