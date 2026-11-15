@@ -87,7 +87,17 @@ export function atomicWrite(path: string, value: string): void {
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
   writeFileSync(temporary, value, { encoding: "utf8", mode: 0o600, flag: "wx" });
   try {
-    renameSync(temporary, path);
+    for (let attempt = 0; ; attempt++) {
+      try { renameSync(temporary, path); break; }
+      catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(code ?? "") || attempt >= 20) throw error;
+        // Windows readers can briefly deny replacement; never unlink the previous complete state.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+        secureDirectory(dirname(path));
+        secureRegularFile(path);
+      }
+    }
   } catch (error) {
     rmSync(temporary, { force: true });
     throw error;

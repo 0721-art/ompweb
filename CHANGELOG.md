@@ -20,6 +20,7 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 - **Approved host updates keep their selected release and operation ownership.** A newer published release does not block pinned admission. Commit decisions become visible only when complete, and active prepared or committing workers retain their update claims past the preparation deadline. A worker that dies during commit retains its recovery claim and blocks new work.
 - **Interrupted server upgrades remain bound to the approved server.** Recovery verifies the installation, restart command and listener, supervisor and process ownership before claiming an attempt. Another installation or source checkout sharing the user’s update directory cannot resume or fail it. Older attempts without that binding are not resumed automatically.
 - **Unknown legacy host activity never grants Force permission.** A shared local daemon can be interrupted only when the approved plan explicitly authorizes Force; otherwise newly busy hosts refuse cutover.
+- **Windows update status publication tolerates brief file-sharing conflicts.** Atomic replacement retries sharing-related errors for at most one second without deleting the prior state. Persistent failures still stop the update and report the error.
 - **Local-host startup ignores unrelated services.** Installation paths match at directory boundaries, and daemon detection distinguishes the host subcommand from directory names or server argument values.
 
 ## [v0.7.1] - 2026-11-14
