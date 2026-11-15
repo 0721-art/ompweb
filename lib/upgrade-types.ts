@@ -13,6 +13,8 @@ export interface UpgradeParticipant {
   blockedReason: string | null;
   stage: "unchanged" | "pending" | "updating" | "ready" | "failed";
   operationId?: string;
+  /** Persisted before sending commit; an uncertain response must never return this participant to preparation. */
+  commitRequested?: true;
   error?: string;
 }
 

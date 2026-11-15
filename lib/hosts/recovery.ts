@@ -23,13 +23,14 @@ import { dialable } from "./daemon-link";
 import { requestHostControl, type HostControlStatus } from "./host-control";
 import { readHostLinks } from "./host-login";
 import type { ApprovedReleasePin, HostUpdateCompatibility, HostUpdateOperation } from "./update-types";
-import { candidateProtocol, claimHostUpdate, getHostUpdateOperation, HostUpdateError, hostUpdateClaimHolder, launchHostUpdateWorker, releaseHostUpdateClaim, resolvePackageManager } from "./updates";
-import { assertOwnedPath, finishHostUpdate, HOST_INSTALL_SHARED, HOST_VERSION_PATTERN, hostLaunch, hostUpdateRoot, installedHostVersionMatches, requireHostUpdateRecovery, sharedHostInstallReason, validateApprovedReleasePin, writeHostUpdateJson, type HostUpdateDescriptor } from "./update-worker";
+import { candidateProtocol, claimHostUpdate, getHostUpdateOperation, HostUpdateError, launchHostUpdateWorker, releaseHostUpdateClaim, resolvePackageManager } from "./updates";
+import { assertOwnedPath, finishHostUpdate, HOST_INSTALL_SHARED, HOST_VERSION_PATTERN, hostLaunch, hostUpdateRoot, installedHostVersionMatches, requireHostUpdateRecovery, sharedHostInstallReason, validateApprovedReleasePin, writeHostUpdateDecision, writeHostUpdateJson, type HostUpdateDescriptor } from "./update-worker";
 
 /** A legacy bootstrap refuses a helper binary without this literal: an older `ompweb` takes the unknown subcommand for a positional and starts a web server. */
 export const RECOVERY_CLI_MARKER = "ompweb-recovery-cli-v1";
 export const RECOVERY_PIN_CLI_MARKER = "ompweb-recovery-pin-cli-v1";
-const USAGE = `${RECOVERY_CLI_MARKER} ${RECOVERY_PIN_CLI_MARKER}: ompweb recover-host --operation <uuid> --version <semver> --min-protocol <n> --max-protocol <n> [--force] [--release-pin <base64url>]`;
+export const RECOVERY_PHASED_CLI_MARKER = "ompweb-recovery-phased-cli-v1";
+const USAGE = `${RECOVERY_CLI_MARKER} ${RECOVERY_PIN_CLI_MARKER} ${RECOVERY_PHASED_CLI_MARKER}: ompweb recover-host --operation <uuid> --version <semver> --min-protocol <n> --max-protocol <n> [--phase prepare|commit|cancel] [--force] [--release-pin <base64url>]`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface HostRecoveryInput {
@@ -43,6 +44,7 @@ export interface HostRecoveryInput {
   force: boolean;
   releasePin?: ApprovedReleasePin;
   requireReleasePin?: boolean;
+  phase?: "prepare" | "commit" | "cancel";
 }
 
 /**
@@ -93,7 +95,7 @@ function startedOperation(input: HostRecoveryInput): HostUpdateOperation | null 
   assertOwnedPath(root, true);
   assertOwnedPath(path);
   const started = JSON.parse(readFileSync(path, "utf8")) as HostUpdateDescriptor;
-  if (started.id !== input.operationId || started.version !== input.version || (started.force === true) !== input.force || started.receipt?.min !== input.compatibility.min || started.receipt?.max !== input.compatibility.max) throw new HostRecoveryRefusal("failed", "operation_conflict", "This operation id was already used with different parameters");
+  if (started.id !== input.operationId || started.version !== input.version || (started.force === true) !== input.force || (started.prepareOnly === true) !== (input.phase !== undefined) || started.receipt?.min !== input.compatibility.min || started.receipt?.max !== input.compatibility.max) throw new HostRecoveryRefusal("failed", "operation_conflict", "This operation id was already used with different parameters");
   if (JSON.stringify(started.releasePin) !== JSON.stringify(input.releasePin) || !!started.requireReleasePin !== !!input.requireReleasePin) throw new HostRecoveryRefusal("failed", "operation_conflict", "This operation id already names different approved artifacts");
   const operation = getHostUpdateOperation();
   if (operation?.id !== input.operationId) throw new HostRecoveryRefusal("failed", "operation_superseded", "A later host update replaced this operation's record");
@@ -190,9 +192,19 @@ export async function startHostRecovery(input: HostRecoveryInput, deps: HostReco
   const { operationId, version, compatibility, force } = input;
   if (!UUID.test(operationId)) throw new HostRecoveryRefusal("failed", "invalid_request", "operationId must be a UUID", false, 400);
   validateRequest(input);
+  if (input.phase !== undefined && !["prepare", "commit", "cancel"].includes(input.phase)) throw new HostRecoveryRefusal("failed", "invalid_request", "Invalid host update phase", false, 400);
+  if (input.phase && (input.requireReleasePin !== true || !input.releasePin)) throw new HostRecoveryRefusal("failed", "invalid_request", "Phased host recovery requires an approved release pin", false, 400);
   if (input.requireReleasePin !== undefined && typeof input.requireReleasePin !== "boolean" || input.requireReleasePin && !input.releasePin) throw new HostRecoveryRefusal("failed", "invalid_request", "Missing approved release pin");
   if (input.releasePin) input.releasePin = validateApprovedReleasePin(input.releasePin, input.version, deps.repo());
   const replayed = startedOperation(input);
+  if (input.phase === "commit" || input.phase === "cancel") {
+    if (!replayed) throw new HostRecoveryRefusal("failed", "operation_missing", "That prepared host recovery operation does not exist");
+    try { return { accepted: true, operation: writeHostUpdateDecision(operationId, input.phase) }; }
+    catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new HostRecoveryRefusal("failed", /not prepared/i.test(message) ? "operation_not_prepared" : "operation_conflict", message);
+    }
+  }
   if (replayed) return { accepted: true, operation: replayed };
   const { status, install, layout, supervised, restartOnly, managerPath } = await prepare(input, deps, true);
   if (input.releasePin && restartOnly) throw new HostRecoveryRefusal("blocked", "artifact_unverified", "An existing installation cannot be adopted as an approved release without artifact evidence");
@@ -200,8 +212,6 @@ export async function startHostRecovery(input: HostRecoveryInput, deps: HostReco
   let root: string;
   try { root = claimHostUpdate(operationId, install.installDir); }
   catch (error) {
-    // The same operation started by a concurrent caller is running, not an error.
-    if (hostUpdateClaimHolder() === operationId) return { accepted: true, operation: { id: operationId, target: "ompweb", version, state: "running", ...(force ? { force: true as const } : {}) } };
     throw error instanceof HostUpdateError ? new HostRecoveryRefusal("failed", error.code, error.message) : error;
   }
   let drained = false;
@@ -228,7 +238,7 @@ export async function startHostRecovery(input: HostRecoveryInput, deps: HostReco
     const operation: HostUpdateOperation = { id: operationId, target: "ompweb", version, state: "running", ...(force ? { force: true as const } : {}) };
     writeHostUpdateJson(join(root, "status.json"), { operation, startedAt: Date.now(), daemonPid: status.pid });
     recorded = true;
-    const descriptor: HostUpdateDescriptor = { id: operationId, target: "ompweb", version, fromVersion: status.version, ...layout, daemonPid: status.pid, process: supervised, managerPath, releaseRepo: deps.repo(), restartOnly: restartOnly || undefined, force: force || undefined, receipt: compatibility, recovery: { drained } };
+    const descriptor: HostUpdateDescriptor = { id: operationId, target: "ompweb", version, fromVersion: status.version, ...layout, daemonPid: status.pid, process: supervised, managerPath, releaseRepo: deps.repo(), restartOnly: restartOnly || undefined, prepareOnly: input.phase === "prepare" || undefined, force: force || undefined, receipt: compatibility, recovery: { drained } };
     descriptor.releasePin = input.releasePin;
     descriptor.requireReleasePin = input.requireReleasePin;
     await deps.launchWorker(root, descriptor, typeof Bun !== "undefined" && Bun.isStandaloneExecutable ? "compiled" : "script");
@@ -284,7 +294,7 @@ export function parseHostRecoveryArgs(argv: string[]): HostRecoveryInput {
     if (flag === "--force") {
       if (force) throw new Error("--force given twice");
       force = true;
-    } else if (["--operation", "--version", "--min-protocol", "--max-protocol", "--release-pin"].includes(flag)) {
+    } else if (["--operation", "--version", "--min-protocol", "--max-protocol", "--release-pin", "--phase"].includes(flag)) {
       const value = argv[++index];
       if (value === undefined || value.startsWith("--")) throw new Error(`${flag} needs a value`);
       if (values.has(flag)) throw new Error(`${flag} given twice`);
@@ -302,7 +312,9 @@ export function parseHostRecoveryArgs(argv: string[]): HostRecoveryInput {
   const encoded = values.get("--release-pin");
   if (encoded !== undefined && (encoded.length > 8192 || !/^[A-Za-z0-9_-]+$/.test(encoded) || Buffer.from(encoded, "base64url").toString("base64url") !== encoded)) throw new Error("Invalid --release-pin encoding");
   const releasePin = encoded === undefined ? undefined : validateApprovedReleasePin(JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")), version, releaseRepo());
-  return { operationId: operation.toLowerCase(), version, compatibility: { min: Number(min), max: Number(max) }, force, ...(releasePin ? { releasePin, requireReleasePin: true } : {}) };
+  const phase = values.get("--phase");
+  if (phase !== undefined && !["prepare", "commit", "cancel"].includes(phase)) throw new Error("--phase must be prepare, commit or cancel");
+  return { operationId: operation.toLowerCase(), version, compatibility: { min: Number(min), max: Number(max) }, force, ...(phase ? { phase: phase as HostRecoveryInput["phase"] } : {}), ...(releasePin ? { releasePin, requireReleasePin: true } : {}) };
 }
 
 /** `ompweb recover-host <argv>`: the exit code; one JSON line on stdout says what happened. 0 only once the detached worker was launched (or the host already runs the release). */

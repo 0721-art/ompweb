@@ -8,7 +8,7 @@ import { releaseRepo } from "./release-repo";
 import { checkNpmUpdate, detectInstallMethod } from "./npm-update";
 import { isUpdateDisabled } from "./update-policy";
 import { requestHostControl } from "./hosts/host-control";
-import { getHostSoftwareUpdates, getHostUpgradeInventory, hostsSnapshot, updateHostSoftware, type HostUpgradeInventory } from "./hosts/hub";
+import { getHostSoftwareUpdates, getHostUpgradeInventory, updateHostSoftware, type HostUpgradeInventory } from "./hosts/hub";
 import { assertOwnedPath, fetchHostUpdateBytes, HOST_VERSION_PATTERN, validateApprovedReleasePin } from "./hosts/update-worker";
 import { HostOpError } from "./hosts/link-protocol";
 import type { ApprovedReleasePin, HostUpdateCompatibility } from "./hosts/update-types";
@@ -116,6 +116,7 @@ function validParticipant(value: unknown): value is UpgradeParticipant {
     && (value.blockedReason === null || typeof value.blockedReason === "string")
     && ["unchanged", "pending", "updating", "ready", "failed"].includes(String(value.stage))
     && (value.operationId === undefined || typeof value.operationId === "string" && value.operationId.length <= 128)
+    && (value.commitRequested === undefined || value.commitRequested === true)
     && (value.error === undefined || typeof value.error === "string");
 }
 
@@ -157,11 +158,15 @@ export function getApprovedReleasePin(attemptId: string): ApprovedReleasePin {
   return pin;
 }
 
-function snapshot(inventory: HostUpgradeInventory[]): string {
-  return createHash("sha256").update(JSON.stringify(inventory.map(({ host, sessionProcesses, sessionIds }) => ({
+function inventoryIdentity(inventory: HostUpgradeInventory[]) {
+  return inventory.map(({ host, sessionProcesses, sessionIds }) => ({
     id: host.id, version: host.ompwebVersion ?? null, protocol: host.hostVersion,
     maintenance: host.apiVersion ?? null, sessions: sessionIds, processes: sessionProcesses,
-  })).sort((a, b) => a.id.localeCompare(b.id)))).digest("hex");
+  })).sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function snapshot(inventory: HostUpgradeInventory[]): string {
+  return createHash("sha256").update(JSON.stringify(inventoryIdentity(inventory))).digest("hex");
 }
 
 function inside(root: string, file: string): boolean {
@@ -223,7 +228,7 @@ export async function prepareUpgradePlan(attemptId: string, targetVersion: strin
   const plan = buildUpgradePlan({ id: attemptId, fromVersion, targetVersion, compatibility: candidate.compatibility, inventory, sharedLocal, localMissing });
   await Promise.all(plan.hosts.filter((host) => host.needsUpgrade && host.recovery !== "shared-local" && !(host.id === "local" && localMissing) && !host.blockedReason).map(async (host) => {
     try {
-      const status = await getHostSoftwareUpdates(host.id, true, plan.compatibility, candidate.pin);
+      const status = await getHostSoftwareUpdates(host.id, true, plan.compatibility, candidate.pin, true);
       if (status.ompweb.installMethod !== "binary") needsNpm = true;
       if (status.ompweb.installMethod !== "binary" && !candidate.pin.npm) {
         host.blockedReason = "The official npm release required by this host could not be pinned";
@@ -241,7 +246,7 @@ export async function prepareUpgradePlan(attemptId: string, targetVersion: strin
   plan.blockedReason = plan.hosts.find((host) => host.blockedReason)?.blockedReason ?? null;
   const directory = planDirectory(attemptId, true);
   mkdirSync(directory, { mode: 0o700 });
-  writeFileSync(join(directory, "identity.json"), JSON.stringify({ snapshot: snapshot(inventory), release: candidate.fingerprint, pin: candidate.pin }), { flag: "wx", mode: 0o600 });
+  writeFileSync(join(directory, "identity.json"), JSON.stringify({ inventory: inventoryIdentity(inventory), snapshot: snapshot(inventory), release: candidate.fingerprint, pin: candidate.pin }), { flag: "wx", mode: 0o600 });
   writePlan(plan);
   return plan;
 }
@@ -284,53 +289,114 @@ async function coordinateHosts(attemptId: string): Promise<UpgradePlan> {
   const plan = getUpgradePlan(attemptId);
   if (!plan?.approved) throw new UpgradePlanError("approval_required", "The upgrade plan has not been approved");
   const releasePin = getApprovedReleasePin(attemptId);
-  if (plan.state === "ready" || plan.state === "updating-server" || plan.state === "succeeded") return plan;
+  if (plan.state === "updating-server" || plan.state === "succeeded") return plan;
   if (plan.state === "failed" || plan.state === "recovery-required") throw new UpgradePlanError("recovery_required", plan.error || "The previous coordinated update requires recovery");
-  plan.state = "updating-hosts";
-  writePlan(plan);
-  let recoveryRequired = false;
-  try {
-    const registered = hostsSnapshot().hosts.map((host) => host.id).sort();
-    if (JSON.stringify(registered) !== JSON.stringify(plan.hosts.map((host) => host.id).sort())) throw new UpgradePlanError("plan_changed", "The registered host set changed before server cutover", 412);
-    for (const host of plan.hosts) {
-      renewLease(attemptId);
-      if (!host.needsUpgrade || host.recovery === "shared-local" || host.stage === "ready") continue;
-      if (host.id === "local" && host.currentVersion === null) continue; // Started from the selected release by the server worker.
-      host.stage = "updating";
-      host.operationId ??= randomUUID();
-      writePlan(plan);
-      const deadline = Date.now() + upgradePlanTimings.hostTimeoutMs;
-      for (;;) {
-        renewLease(attemptId);
-        try {
-          const status = await getHostSoftwareUpdates(host.id, true, plan.compatibility, releasePin);
-          if (status.operation?.id === host.operationId && (status.operation.state === "failed" || status.operation.recoveryRequired)) {
-            recoveryRequired = status.operation.recoveryRequired === true;
-            throw new UpgradePlanError("host_upgrade_failed", `${host.label}: ${status.operation.error || "Host update failed"}`);
-          }
-          if (status.ompweb.currentVersion === plan.targetVersion && status.operation?.state === "succeeded"
-            && status.operation.id === host.operationId && status.operation.version === plan.targetVersion) break;
-          if (status.ompweb.currentVersion !== plan.targetVersion && status.operation?.id !== host.operationId) {
-            const accepted = await updateHostSoftware(host.id, "ompweb", plan.targetVersion, { force: plan.approved.force, compatibility: plan.compatibility, operationId: host.operationId, releasePin, requireReleasePin: true });
-            if (accepted.operation.id !== host.operationId) throw new UpgradePlanError("host_operation_changed", `${host.label} accepted a different update operation`);
-          }
-        } catch (error) {
-          if (!(error instanceof HostOpError && [503, 504].includes(error.status))) throw error;
+  const required = plan.hosts.filter((host) => host.needsUpgrade && host.recovery !== "shared-local" && !(host.id === "local" && host.currentVersion === null));
+  const options = (host: UpgradeParticipant, phase: "prepare" | "commit" | "cancel") => ({
+    force: plan.approved!.force, compatibility: plan.compatibility, operationId: host.operationId!,
+    releasePin, requireReleasePin: true, phase,
+  });
+  const identityPath = join(planDirectory(attemptId), "identity.json");
+  assertOwnedPath(identityPath);
+  const identity = JSON.parse(readFileSync(identityPath, "utf8"));
+  if (!isRecord(identity) || !Array.isArray(identity.inventory)
+    || createHash("sha256").update(JSON.stringify(identity.inventory)).digest("hex") !== identity.snapshot) {
+    throw new UpgradePlanError("plan_changed", "The approved participant inventory is unavailable; review a new plan");
+  }
+  const approvedInventory = identity.inventory;
+  const revalidate = async (): Promise<void> => {
+    const current = inventoryIdentity(await getHostUpgradeInventory(required.flatMap((host) => host.operationId ? [host.operationId] : [])));
+    if (JSON.stringify(current.map((host) => host.id)) !== JSON.stringify(plan.hosts.map((host) => host.id).sort())) {
+      throw new UpgradePlanError("plan_changed", "The registered host set changed before server cutover", 412);
+    }
+    for (const host of current) {
+      const participant = plan.hosts.find((item) => item.id === host.id)!;
+      if (participant.commitRequested || participant.stage === "ready") {
+        const status = await getHostSoftwareUpdates(host.id, true, plan.compatibility, releasePin);
+        if (!status.operation || status.operation.id !== participant.operationId || status.operation.version !== plan.targetVersion
+          || status.operation.target !== "ompweb" || status.operation.state !== "succeeded"
+          || status.ompweb.currentVersion !== plan.targetVersion || host.protocol === null
+          || host.protocol < plan.compatibility.min || host.protocol > plan.compatibility.max) {
+          throw new UpgradePlanError("plan_changed", `${participant.label}: the committed participant no longer has its approved release receipt`, 412);
         }
-        if (Date.now() >= deadline) throw new UpgradePlanError("host_upgrade_timeout", `${host.label} did not acknowledge the expected release and update operation; server cutover was not performed`);
-        await pause(upgradePlanTimings.pollMs);
+      } else if (JSON.stringify(host) !== JSON.stringify(approvedInventory.find((item: unknown) => isRecord(item) && item.id === host.id))) {
+        throw new UpgradePlanError("plan_changed", `${participant.label}: the approved host version, protocol or session inventory changed`, 412);
       }
+    }
+  };
+  let recoveryRequired = false;
+  const waitFor = async (host: UpgradeParticipant, phase: "prepare" | "commit"): Promise<void> => {
+    const deadline = Date.now() + upgradePlanTimings.hostTimeoutMs;
+    let dispatched = false;
+    for (;;) {
+      renewLease(attemptId);
+      try {
+        const status = await getHostSoftwareUpdates(host.id, true, plan.compatibility, releasePin);
+        const matches = status.operation !== null && status.operation.id === host.operationId && status.operation.version === plan.targetVersion && status.operation.target === "ompweb";
+        if (matches && (status.operation!.state === "failed" || status.operation!.recoveryRequired)) {
+          recoveryRequired ||= status.operation!.recoveryRequired === true;
+          throw new UpgradePlanError("host_upgrade_failed", `${host.label}: ${status.operation!.error || "Host update failed"}`);
+        }
+        if (matches && status.operation!.state === "succeeded" && status.ompweb.currentVersion === plan.targetVersion) {
+          if (!host.commitRequested) throw new UpgradePlanError("plan_changed", `${host.label} changed release before its coordinated commit`, 412);
+          return;
+        }
+        if (phase === "prepare" && matches && status.operation!.prepared === true) return;
+        if (status.ompweb.currentVersion === plan.targetVersion && !matches) {
+          throw new UpgradePlanError("plan_changed", `${host.label} reached the target without this plan's receipt`, 412);
+        }
+        // A restarted coordinator may resend once; do not launch a bootstrap on every status poll.
+        if (!dispatched) {
+          const accepted = await updateHostSoftware(host.id, "ompweb", plan.targetVersion, options(host, phase));
+          if (accepted.operation.id !== host.operationId) throw new UpgradePlanError("host_operation_changed", `${host.label} accepted a different update operation`);
+          dispatched = true;
+        }
+      } catch (error) {
+        if (!(error instanceof HostOpError && [503, 504].includes(error.status))) throw error;
+      }
+      if (Date.now() >= deadline) throw new UpgradePlanError("host_upgrade_timeout", `${host.label} did not acknowledge ${phase === "prepare" ? "verified preparation" : "the expected release and update operation"}; server cutover was not performed`);
+      await pause(upgradePlanTimings.pollMs);
+    }
+  };
+  try {
+    // Reconcile a commit already sent before a server restart before checking the resulting inventory.
+    for (const host of required.filter((item) => item.commitRequested && item.stage !== "ready")) {
+      await waitFor(host, "commit");
       host.stage = "ready";
       writePlan(plan);
     }
+    await revalidate();
+    plan.state = "updating-hosts";
+    writePlan(plan);
+    for (const host of required.filter((item) => item.stage !== "ready")) {
+      host.stage = "updating";
+      host.operationId ??= randomUUID();
+      writePlan(plan);
+      await waitFor(host, "prepare");
+    }
+    // No host stops until every required participant has staged and preflighted its exact approved artifacts.
+    await revalidate();
+    for (const host of required.filter((item) => item.stage !== "ready")) {
+      host.commitRequested = true;
+      writePlan(plan);
+      await waitFor(host, "commit");
+      host.stage = "ready";
+      writePlan(plan);
+    }
+    await revalidate();
     plan.state = "ready";
     writePlan(plan);
     return plan;
   } catch (error) {
+    // Cancel only preparations; an uncertain commit may already be replacing its installation.
+    for (const host of required.filter((item) => item.operationId && !item.commitRequested)) {
+      try { await updateHostSoftware(host.id, "ompweb", plan.targetVersion, options(host, "cancel")); }
+      catch { /* The prepared worker expires without committing; never authorize a stop to clean it up. */ }
+    }
     plan.error = error instanceof Error ? error.message : "The coordinated host update failed";
     const host = plan.hosts.find((item) => item.stage === "updating");
     if (host) { host.stage = "failed"; host.error = plan.error; }
-    plan.state = recoveryRequired || plan.hosts.some((item) => item.stage === "ready") ? "recovery-required" : "failed";
+    plan.state = recoveryRequired || required.some((item) => item.commitRequested || item.stage === "ready") ? "recovery-required" : "failed";
     writePlan(plan);
     throw error;
   }

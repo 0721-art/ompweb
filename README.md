@@ -192,7 +192,9 @@ service and `ompweb-host`. Uninstall removes both.
 `npx @kahme247/ompweb@latest`) installs no service. The production server prepares
 the local link and starts an independent `ompweb host` if none answers its private
 control endpoint. It reuses an existing daemon, including an older one awaiting
-recovery; concurrent starts cannot create two hosts.
+recovery; concurrent starts cannot create two hosts. A configured native host
+supervisor keeps ownership even when startup is slow: the web server does not
+replace it with an unmanaged daemon after a fixed grace period.
 
 - **Restarting or redeploying the web server does not interrupt runs.** The daemon
   keeps the omp processes running; the restarted web server takes them over, with
@@ -240,9 +242,13 @@ A non-root system service with custom polkit grants is refused when its exact
 stop/start authority cannot be proved without changing service state; use a user
 unit rather than relying on an unverifiable grant.
 
-Downloads and runner preflight happen before the relevant process stops. Progress
-survives web-server restarts; completion requires the expected release, approved
-protocol receipt and connection to the specific server being upgraded. A failed
+All required participants download, verify and preflight their pinned release
+before the coordinator authorizes any host to stop. A failed preparation cancels
+the other preparations without changing their installations. Host version,
+protocol and session inventory are checked again before committing and before
+server cutover; an unrelated change invalidates the approved plan.
+Progress survives web-server restarts; completion requires the expected release,
+approved protocol receipt and connection to the specific server being upgraded. A failed
 cutover restores the previous installation where possible and reports any
 participant still requiring recovery. An uncertain shutdown or maintenance reply
 retains its update claim and displays the recovery error instead of permitting a

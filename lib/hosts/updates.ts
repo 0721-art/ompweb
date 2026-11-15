@@ -11,8 +11,8 @@ import { releaseRepo } from "../release-repo";
 import { assertUpgradeProcessControl, inspectUpgradeProcess, launchDetachedUpgrade, type UpgradeProcess } from "../upgrade-process";
 import { processStartIdentity, isProcessAlive } from "../process-identity";
 import { isRecord } from "../type-guards";
-import type { HostSoftwareUpdate, HostUpdateBlocker, HostUpdateCompatibility, HostUpdateInfo, HostUpdateOperation, HostUpdateRequest, HostUpdateTarget } from "./update-types";
-import { assertOwnedPath, ensureHostUpdateRoot, fetchHostUpdateBytes, finishHostUpdate, HOST_INSTALL_SHARED, HOST_VERSION_PATTERN, hostLaunch, hostReleaseName, hostUpdateRoot, installedHostVersionMatches, pruneHostUpdateArtifacts, readHostUpdateState, sharedHostInstallReason, validateApprovedReleasePin, writeHostUpdateJson, type HostUpdateDescriptor } from "./update-worker";
+import type { ApprovedReleasePin, HostSoftwareUpdate, HostUpdateBlocker, HostUpdateCompatibility, HostUpdateInfo, HostUpdateOperation, HostUpdateRequest, HostUpdateTarget } from "./update-types";
+import { assertOwnedPath, ensureHostUpdateRoot, fetchHostUpdateBytes, finishHostUpdate, HOST_INSTALL_SHARED, HOST_VERSION_PATTERN, hostLaunch, hostReleaseName, hostUpdateRoot, installedHostVersionMatches, pruneHostUpdateArtifacts, readHostUpdateState, sharedHostInstallReason, validateApprovedReleasePin, writeHostUpdateDecision, writeHostUpdateJson, type HostUpdateDescriptor } from "./update-worker";
 
 // Covers a 15 min release download (update-worker.ts DOWNLOAD_TIMEOUT_MS) plus preflight, stop and restart.
 const LEASE_MS = 30 * 60 * 1000;
@@ -51,9 +51,9 @@ export function getHostUpdateOperation(): HostUpdateOperation | null {
   return state.operation;
 }
 
-/** A running update refuses new sessions and project preparation, except a forced one before its commit: its sessions end at the commit anyway, and refusing earlier would only idle the host while it stages. */
+/** Forced staging permits work until preparation finishes; the coordinated gate then fences the approved inventory. */
 export function hostUpdateBlocksNewWork(operation: HostUpdateOperation | null): boolean {
-  return operation?.state === "running" && !(operation.force === true && operation.committing !== true);
+  return operation?.state === "running" && !(operation.force === true && operation.committing !== true && operation.prepared !== true);
 }
 
 /** Called only after the new daemon's link is welcomed. Rollback daemons also acknowledge their old version. */
@@ -198,6 +198,7 @@ async function evaluateHostUpdate(compatibility: HostUpdateCompatibility, refres
   const [npm, ompVersion] = await Promise.all([checkNpmUpdate(refresh).catch(() => null), getOmpVersion()]);
   const base: HostSoftwareUpdate = { currentVersion: null, availableVersion: null, updateAvailable: false, canUpdate: false, blockers: [], canForceUpdate: false, blockedReason: null, updateCommand: "" };
   base.supportsReleasePin = true;
+  base.supportsTwoPhaseUpdate = true;
   const installMethod = typeof Bun !== "undefined" && Bun.isStandaloneExecutable ? "binary" : detectInstallMethod(installDirectory());
   const ompweb: HostUpdateInfo["ompweb"] = { ...base, ...npm, currentVersion: packageJson.version, installMethod, protocolVersion: null, activeSessions: safetyState.sessions(), updateCommand: installMethod === "binary" ? `https://github.com/${releaseRepo()}/releases/latest` : installMethod === "bun" ? "bun add -g @kahme247/ompweb" : "npm install -g @kahme247/ompweb" };
   // omp updates with ompweb (its runner ships inside each release): the row only reports the running version.
@@ -333,6 +334,31 @@ export function resolvePackageManager(method: "npm" | "bun"): string {
   return resolve(manager);
 }
 
+function hostUpdateDescriptor(id: string): HostUpdateDescriptor | null {
+  const path = join(hostUpdateRoot(), id, "descriptor.json");
+  if (!existsSync(path)) return null;
+  assertOwnedPath(hostUpdateRoot(), true);
+  assertOwnedPath(dirname(path), true);
+  assertOwnedPath(path);
+  return JSON.parse(readFileSync(path, "utf8")) as HostUpdateDescriptor;
+}
+
+function sameCompatibility(left: HostUpdateCompatibility | undefined, right: HostUpdateCompatibility | undefined): boolean {
+  return left === undefined ? right === undefined : right !== undefined && left.min === right.min && left.max === right.max;
+}
+
+function assertMatchingHostUpdate(descriptor: HostUpdateDescriptor, target: HostUpdateTarget, version: string, compatibility: HostUpdateCompatibility, request: HostUpdateRequest, releasePin: ApprovedReleasePin | undefined): void {
+  const phased = request.phase !== undefined;
+  if (descriptor.id !== request.operationId || descriptor.target !== target || descriptor.version !== version ||
+      (descriptor.force === true) !== (request.force === true) || (descriptor.prepareOnly === true) !== phased ||
+      (descriptor.compatibility !== undefined ? !sameCompatibility(descriptor.compatibility, compatibility) : phased) ||
+      !sameCompatibility(descriptor.receipt, request.targetCompatibility) ||
+      JSON.stringify(descriptor.releasePin) !== JSON.stringify(releasePin) ||
+      !!descriptor.requireReleasePin !== !!request.requireReleasePin) {
+    throw new HostUpdateError("operation_conflict", "That operation id already names a different host update");
+  }
+}
+
 /**
  * Starts the update of this host. Without `request.force` a host with activity is refused (`host_busy`) and nothing is
  * touched. With it, only that activity is waived: the release is still staged, digest-verified and preflighted first, a
@@ -344,23 +370,32 @@ export async function startHostUpdate(target: HostUpdateTarget, version: string,
   assertCompatibility(compatibility);
   if (request.targetCompatibility !== undefined) assertCompatibility(request.targetCompatibility);
   if (request.force !== undefined && typeof request.force !== "boolean") throw new HostUpdateError("invalid_request", "force must be a boolean", 400);
+  if (request.phase !== undefined && !["prepare", "commit", "cancel"].includes(request.phase)) throw new HostUpdateError("invalid_request", "Invalid host update phase", 400);
   const force = request.force === true;
   if (target !== "ompweb") throw new HostUpdateError("invalid_target", "Invalid host software target", 400);
   if (typeof version !== "string" || version.length > 100 || !HOST_VERSION_PATTERN.test(version)) throw new HostUpdateError("invalid_version", "Invalid host update version", 400);
   if (request.operationId !== undefined && (typeof request.operationId !== "string" || !OPERATION_ID.test(request.operationId))) throw new HostUpdateError("invalid_request", "operationId must be a UUID", 400);
+  if (request.phase && (!request.operationId || request.requireReleasePin !== true || !request.releasePin)) throw new HostUpdateError("invalid_request", "Phased host updates require an operationId and approved release pin", 400);
   if (request.requireReleasePin !== undefined && typeof request.requireReleasePin !== "boolean" || request.requireReleasePin && !request.releasePin) throw new HostUpdateError("invalid_request", "Missing approved release pin", 400);
   const releasePin = request.releasePin === undefined ? undefined : validateApprovedReleasePin(request.releasePin, version, releaseRepo());
-  // A coordinator that retries an operation gets its state back; nothing is started twice.
-  const existing = request.operationId === undefined ? null : getHostUpdateOperation();
-  if (existing && existing.id === request.operationId) {
-    if (existing.target !== target || existing.version !== version) throw new HostUpdateError("operation_conflict", "That operation id already names a different host update");
-    if (releasePin || request.requireReleasePin) {
-      const path = join(hostUpdateRoot(), existing.id, "descriptor.json");
-      assertOwnedPath(path);
-      const descriptor = JSON.parse(readFileSync(path, "utf8")) as HostUpdateDescriptor;
-      if (!descriptor.releasePin || JSON.stringify(validateApprovedReleasePin(descriptor.releasePin, version, releaseRepo())) !== JSON.stringify(releasePin) || !!descriptor.requireReleasePin !== !!request.requireReleasePin) throw new HostUpdateError("operation_conflict", "That operation id already names different approved artifacts");
+  // A coordinator retry is accepted only when every immutable parameter still names this exact attempt.
+  if (request.operationId !== undefined) {
+    const descriptor = hostUpdateDescriptor(request.operationId);
+    const existing = getHostUpdateOperation();
+    if (descriptor) {
+      assertMatchingHostUpdate(descriptor, target, version, compatibility, request, releasePin);
+      if (!existing || existing.id !== request.operationId) throw new HostUpdateError("operation_conflict", "That host update operation was superseded");
+      if (request.phase === "commit" || request.phase === "cancel") {
+        try { return { accepted: true, operation: writeHostUpdateDecision(request.operationId, request.phase) }; }
+        catch (error) {
+          const message = messageOf(error);
+          throw new HostUpdateError(/not prepared/i.test(message) ? "operation_not_prepared" : "operation_conflict", message);
+        }
+      }
+      return { accepted: true, operation: existing };
     }
-    return { accepted: true, operation: existing };
+    if (request.phase === "commit" || request.phase === "cancel") throw new HostUpdateError("operation_missing", "That prepared host update operation does not exist");
+    if (existing?.id === request.operationId) throw new HostUpdateError("operation_conflict", "That operation has no immutable update descriptor");
   }
   if (isUpdateDisabled()) throw new HostUpdateError("updates_disabled", "Updates are disabled by OMP_WEB_DISABLE_AUTOUPDATE", 403);
   const id = request.operationId ?? randomUUID();
@@ -382,7 +417,7 @@ export async function startHostUpdate(target: HostUpdateTarget, version: string,
     const busy = safetyGuard?.() ?? (safetyGuard ? null : "Host restart safety is not configured");
     if (busy && (!force || safetyState.drained())) throw new HostUpdateError(safetyState.drained() ? "host_drained" : "host_busy", busy);
     const binary = method === "binary";
-    const descriptor: HostUpdateDescriptor = { id, target, version, fromVersion: packageJson.version, installMethod: method, installDir: installDirectory(), runtime: process.execPath, hostArgs: hostArguments(binary), cwd: process.cwd(), daemonPid: process.pid, process: plan.process, releaseRepo: releaseRepo(), restartOnly: plan.restartOnly || undefined, force: force || undefined, receipt: request.targetCompatibility };
+    const descriptor: HostUpdateDescriptor = { id, target, version, fromVersion: packageJson.version, installMethod: method, installDir: installDirectory(), runtime: process.execPath, hostArgs: hostArguments(binary), cwd: process.cwd(), daemonPid: process.pid, process: plan.process, releaseRepo: releaseRepo(), restartOnly: plan.restartOnly || undefined, prepareOnly: request.phase === "prepare" || undefined, compatibility, force: force || undefined, receipt: request.targetCompatibility };
     descriptor.releasePin = releasePin;
     descriptor.requireReleasePin = request.requireReleasePin;
     if (!binary && !descriptor.restartOnly) descriptor.managerPath = resolvePackageManager(method as "npm" | "bun");

@@ -25,6 +25,7 @@ export const HOST_RELEASE_MAX_EXPANDED = 1024 * 1024 * 1024;
 export const HOST_RELEASE_MAX_MEMBER = 512 * 1024 * 1024;
 /** The whole release download (or npm install): 512 MiB in 15 min needs about 5 Mbit/s. */
 const DOWNLOAD_TIMEOUT_MS = 15 * 60 * 1000;
+const PREPARED_GATE_TIMEOUT_MS = 30 * 60 * 1000;
 export const HOST_VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/;
 
 export interface HostUpdateStoredState {
@@ -54,6 +55,10 @@ export interface HostUpdateDescriptor {
   releaseRepo?: string;
   releasePin?: ApprovedReleasePin;
   requireReleasePin?: boolean;
+  /** Full staging and preflight stop at a durable gate until this operation is committed or cancelled. */
+  prepareOnly?: boolean;
+  /** The running server compatibility supplied when this immutable operation was created. */
+  compatibility?: { min: number; max: number };
   /** Explicitly approved to end this host's activity: bypasses only the activity wait, never any release or process check. */
   force?: boolean;
   /** The protocol range the candidate must speak for a maintenance receipt to acknowledge it, while its application protocol may await the server's cutover. */
@@ -116,6 +121,49 @@ export function writeHostUpdateJson(path: string, value: unknown): void {
   const temporary = `${path}.${randomUUID()}.tmp`;
   writeFileSync(temporary, JSON.stringify(value), { mode: 0o600, flag: "wx" });
   try { renameSync(temporary, path); } finally { rmSync(temporary, { force: true }); }
+}
+
+export type HostUpdateDecision = "commit" | "cancel";
+interface HostUpdateDecisionMarker {
+  id: string;
+  version: string;
+  decision: HostUpdateDecision;
+}
+function readHostUpdateDecision(d: Pick<HostUpdateDescriptor, "id" | "version">): HostUpdateDecision | null {
+  const path = join(hostUpdateRoot(), d.id, "decision.json");
+  if (!existsSync(path)) return null;
+  assertOwnedPath(path);
+  if (lstatSync(path).size > 1024) throw new Error("Host update decision is too large");
+  const marker = JSON.parse(readFileSync(path, "utf8")) as HostUpdateDecisionMarker;
+  if (marker.id !== d.id || marker.version !== d.version || !["commit", "cancel"].includes(marker.decision)) throw new Error("Host update decision does not match this operation");
+  return marker.decision;
+}
+
+/** Durably approves or cancels one already-prepared worker. Repeating the same decision is idempotent. */
+export function writeHostUpdateDecision(id: string, decision: HostUpdateDecision): HostUpdateOperation {
+  if (!/^[a-zA-Z0-9-]{1,80}$/.test(id) || !["commit", "cancel"].includes(decision)) throw new Error("Invalid host update decision");
+  const root = hostUpdateRoot();
+  const descriptorPath = join(root, id, "descriptor.json");
+  if (!existsSync(descriptorPath)) throw new Error("Host update operation does not exist");
+  assertOwnedPath(root, true);
+  assertOwnedPath(dirname(descriptorPath), true);
+  assertOwnedPath(descriptorPath);
+  const descriptor = JSON.parse(readFileSync(descriptorPath, "utf8")) as HostUpdateDescriptor;
+  const state = readHostUpdateState();
+  if (descriptor.id !== id || !descriptor.prepareOnly || !HOST_VERSION_PATTERN.test(descriptor.version) || state?.operation.id !== id || state.operation.version !== descriptor.version) throw new Error("Host update operation does not match the prepared worker");
+  const existing = readHostUpdateDecision(descriptor);
+  if (existing) {
+    if (existing !== decision) throw new Error("Host update operation already has a different decision");
+    return state.operation;
+  }
+  if (state.operation.state !== "running" || decision === "commit" && state.operation.prepared !== true) throw new Error("Host update operation is not prepared");
+  const marker = join(root, id, "decision.json");
+  try { writeFileSync(marker, JSON.stringify({ id, version: descriptor.version, decision }), { flag: "wx", mode: 0o600 }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    if (readHostUpdateDecision(descriptor) !== decision) throw new Error("Host update operation already has a different decision");
+  }
+  return state.operation;
 }
 export function readHostUpdateState(): HostUpdateStoredState | null {
   const root = hostUpdateRoot();
@@ -704,6 +752,27 @@ async function resumeDrainedDaemon(): Promise<void> {
   const { requestHostControl } = await import("./host-control");
   await requestHostControl("resume");
 }
+
+function markHostUpdatePrepared(d: HostUpdateDescriptor): HostUpdateStoredState {
+  const state = readHostUpdateState();
+  if (state?.operation.id !== d.id || state.operation.version !== d.version || state.operation.state !== "running") throw new Error("Host update no longer owns the operation");
+  const prepared = { ...state, operation: { ...state.operation, prepared: true as const } };
+  writeHostUpdateJson(join(hostUpdateRoot(), "status.json"), prepared);
+  return prepared;
+}
+
+async function waitForHostUpdateDecision(d: HostUpdateDescriptor): Promise<HostUpdateDecision> {
+  const state = markHostUpdatePrepared(d);
+  const deadline = Math.min(Date.now() + PREPARED_GATE_TIMEOUT_MS, state.startedAt + PREPARED_GATE_TIMEOUT_MS);
+  for (;;) {
+    const current = readHostUpdateState();
+    if (current?.operation.id !== d.id || current.operation.version !== d.version || current.operation.state !== "running" || current.operation.prepared !== true) throw new Error("Host update no longer owns the prepared operation");
+    const decision = readHostUpdateDecision(d);
+    if (decision) return decision;
+    if (Date.now() >= deadline) throw new Error("Prepared host update expired before commit");
+    await pause(100);
+  }
+}
 /**
  * Restarts the host through its inspected supervisor and waits for its acknowledgement. Only the instance launched here
  * may vouch. A maintenance receipt (marker.receipt) is accepted only when this operation asked for one (descriptor.receipt)
@@ -748,6 +817,8 @@ function validateDescriptor(path: string): HostUpdateDescriptor {
   // A v10 daemon copies this new worker after the shared web installation has already been replaced.
   if (d.releaseRepo === undefined ? d.restartOnly !== true : typeof d.releaseRepo !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(d.releaseRepo)) throw new Error("Invalid host update descriptor");
   if (d.restartOnly !== undefined && typeof d.restartOnly !== "boolean") throw new Error("Invalid host restart-only descriptor");
+  if (d.prepareOnly !== undefined && typeof d.prepareOnly !== "boolean") throw new Error("Invalid host update descriptor");
+  if (d.compatibility !== undefined && (!Number.isSafeInteger(d.compatibility.min) || !Number.isSafeInteger(d.compatibility.max) || d.compatibility.min < 1 || d.compatibility.max < d.compatibility.min)) throw new Error("Invalid host update descriptor: compatibility");
   if (d.force !== undefined && typeof d.force !== "boolean") throw new Error("Invalid host update descriptor");
   if (d.requireReleasePin !== undefined && typeof d.requireReleasePin !== "boolean" || d.requireReleasePin && !d.releasePin) throw new Error("Invalid host update descriptor: missing approved release pin");
   if (d.releasePin !== undefined) d.releasePin = validateApprovedReleasePin(d.releasePin, d.version, d.releaseRepo);
@@ -766,7 +837,8 @@ function validateDescriptor(path: string): HostUpdateDescriptor {
   if (!parent.isDirectory() || parent.isSymbolicLink() || (process.getuid && parent.uid !== process.getuid()) || (process.platform !== "win32" && (parent.mode & 0o022))) throw new Error("Unsafe host installation parent directory");
   if (d.installMethod === "binary") {
     hostReleaseName();
-    if (!existsSync(join(d.installDir, process.platform === "win32" ? "ompweb.exe" : "ompweb")) || !existsSync(join(d.installDir, "dist", "index.html")) || !existsSync(join(d.installDir, process.platform === "win32" ? "ompweb-omp.exe" : "ompweb-omp"))) throw new Error("Incomplete host binary release layout");
+    // The running host may use an operator-supplied runner; the candidate's actual runner is checked by preflight.
+    if (!existsSync(join(d.installDir, process.platform === "win32" ? "ompweb.exe" : "ompweb")) || !existsSync(join(d.installDir, "dist", "index.html"))) throw new Error("Incomplete host binary release layout");
   } else {
     if (basename(d.installDir) !== "ompweb" || basename(dirname(d.installDir)) !== "@kahme247" || basename(dirname(dirname(d.installDir))) !== "node_modules") throw new Error("Package updates require an installed npm/bun package layout");
     const current = JSON.parse(readFileSync(join(d.installDir, "package.json"), "utf8"));
@@ -818,6 +890,19 @@ export async function runHostUpdateWorker(path: string): Promise<number> {
     }
     await preflightHostRelease(d, release ?? d.installDir);
     nonce = d.receipt ? recordPreflight(d) : undefined;
+    if (d.prepareOnly) {
+      const decision = await waitForHostUpdateDecision(d);
+      if (decision === "cancel") throw new Error("Prepared host update was cancelled");
+      if (["1", "true", "yes", "on"].includes((process.env.OMP_WEB_DISABLE_AUTOUPDATE || "").trim().toLowerCase())) throw new Error("Updates are disabled by OMP_WEB_DISABLE_AUTOUPDATE");
+      const currentDescriptor = validateDescriptor(path);
+      if (JSON.stringify(currentDescriptor) !== JSON.stringify(d)) throw new Error("Host update descriptor changed after preparation");
+      if (d.restartOnly && !(await installedHostVersionMatches(d.installMethod, d.installDir, d.version))) throw new Error(restartCandidateMissing);
+      await runtime.process.assertUpgradeProcessControl(plan);
+      if (release) {
+        const sharing = await sharedHostInstallReason(d.installDir, [process.pid], [d.daemonPid]);
+        if (sharing) throw new Error(sharing);
+      }
+    }
     // Normally the daemon blocks new children for the entire persisted running operation; a forced one only from its commit.
     if (readHostUpdateState()?.operation.id !== d.id || readHostUpdateState()?.operation.state !== "running") throw new Error("Host update no longer owns the operation");
     validateDescriptor(path);

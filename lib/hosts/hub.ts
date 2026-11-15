@@ -161,7 +161,7 @@ interface Link {
   lastSeenAt: string | null;
   recoveryHome?: string;
   recoveryInventory?: HelloChannel[];
-  recovery?: { id: string; channel?: string; lines: Set<string> };
+  recovery?: { id: string; channel?: string; lines: Set<string>; phase?: "prepare" | "commit" | "cancel"; requestId?: string };
   autoApprove: boolean;
   notifier: boolean;
   /** The socket whose hello this link took; null while the daemon has none. */
@@ -974,18 +974,22 @@ function applyUp(link: Link, message: UpMessage | UnknownMessage, whole?: UpMess
   }
   // Already applied before a resend.
   if (!joined && !link.up.applied(message.seq)) return;
+  if (message.type === "channels_changed") link.recoveryInventory = message.channels;
   if (recoveryOutput && link.recovery) {
     if (message.type === "stdout") {
       let frame: unknown;
       try { frame = JSON.parse(message.line); } catch { return; }
-      if (isRecord(frame) && String(frame.id) === "1" && (frame.t === "res" || frame.type === "response")) {
+      if (isRecord(frame) && String(frame.id) === (link.recovery.requestId ?? "1") && (frame.t === "res" || frame.type === "response")) {
         const recovery = link.recovery;
         const data = isRecord(frame.data) ? frame.data : null;
-        if (frame.ok === false || frame.success === false || data && typeof data.exitCode === "number" && data.exitCode !== 0) {
+        const failed = frame.ok === false || frame.success === false || !!(data && typeof data.exitCode === "number" && data.exitCode !== 0);
+        if (failed) {
           rejectLegacyBootstrap(link.id, recovery.id, data && typeof data.exitCode === "number"
             ? `The fixed recovery bootstrap exited with code ${data.exitCode}; the host did not acknowledge an upgrade`
             : "The legacy runner refused the fixed recovery bootstrap; no upgrade was acknowledged");
         }
+        // Historical hosts refuse a new runner while the staged update is running; retain this preparation lease.
+        if (recovery.phase === "prepare" && !failed) return;
         void request(link.id, "close", { ch: recovery.channel }, linkTimings.opTimeoutMs, undefined, recovery.id)
           .catch(() => {}).finally(() => { if (link.recovery === recovery) link.recovery = undefined; });
       }
@@ -1652,6 +1656,7 @@ function softwareUpdate(value: unknown): value is HostSoftwareUpdate & Record<st
     && typeof value.updateAvailable === "boolean" && typeof value.canUpdate === "boolean"
     && (value.canForceUpdate === undefined || typeof value.canForceUpdate === "boolean")
     && (value.supportsReleasePin === undefined || typeof value.supportsReleasePin === "boolean")
+    && (value.supportsTwoPhaseUpdate === undefined || typeof value.supportsTwoPhaseUpdate === "boolean")
     && (value.forceMethod === undefined || value.forceMethod === "native" || value.forceMethod === "recovery")
     && nullableString(value.blockedReason) && typeof value.updateCommand === "string";
 }
@@ -1660,7 +1665,8 @@ function updateOperation(value: unknown): value is HostUpdateOperation {
   return isRecord(value) && typeof value.id === "string" && value.id.length > 0 && value.id.length <= 128
     && (value.target === "ompweb" || value.target === "omp") && typeof value.version === "string"
     && ["running", "succeeded", "failed"].includes(String(value.state))
-    && (value.error === undefined || typeof value.error === "string");
+    && (value.error === undefined || typeof value.error === "string")
+    && (value.prepared === undefined || value.prepared === true);
 }
 
 export interface HostUpgradeInventory {
@@ -1672,8 +1678,10 @@ export interface HostUpgradeInventory {
 }
 
 /** Inventory stays on the maintenance plane; legacy metadata is never adopted as application sessions. */
-export async function getHostUpgradeInventory(): Promise<HostUpgradeInventory[]> {
+export async function getHostUpgradeInventory(recoveryOperations: string[] = []): Promise<HostUpgradeInventory[]> {
   return Promise.all(hostsSnapshot().hosts.map(async (host) => {
+    const link = hub().links.get(host.id);
+    const ownedRecovery = link?.recoveryInventory?.filter((channel) => channel.creationId && recoveryOperations.includes(channel.creationId)) ?? [];
     const maintenance = getMaintenanceHost(host.id);
     if (maintenance) {
       const status = await requestMaintenance(host.id, "status", {});
@@ -1682,14 +1690,17 @@ export async function getHostUpgradeInventory(): Promise<HostUpgradeInventory[]>
         throw new HostOpError(502, "host_bad_result", `${host.label || host.id} returned invalid maintenance inventory`);
       }
       const sessionIds: string[] = [];
+      const recoveryIds = ownedRecovery.map((channel) => channel.sessionId);
+      let excluded = 0;
       for (const session of status.sessions) {
         if (!isRecord(session) || !(session.id === null || typeof session.id === "string")) throw new HostOpError(502, "host_bad_result", "A host returned invalid session inventory");
+        const own = recoveryIds.indexOf(session.id);
+        if (own !== -1) { recoveryIds.splice(own, 1); excluded++; continue; }
         if (typeof session.id === "string") sessionIds.push(session.id);
       }
-      return { host, maintenance: true, sessionProcesses: Number(status.sessionProcesses), activeTurns: Number(status.activeTurns), sessionIds: sessionIds.sort() };
+      return { host, maintenance: true, sessionProcesses: Number(status.sessionProcesses) - excluded, activeTurns: Number(status.activeTurns), sessionIds: sessionIds.sort() };
     }
-    const link = hub().links.get(host.id);
-    const sessions = link?.socket ? link.recoveryInventory : undefined;
+    const sessions = link?.socket ? link.recoveryInventory?.filter((channel) => !ownedRecovery.includes(channel)) : undefined;
     return {
       host, maintenance: false, sessionProcesses: sessions?.length ?? null, activeTurns: null,
       sessionIds: sessions?.flatMap((session) => session.sessionId ? [session.sessionId] : []).sort() ?? [],
@@ -1698,7 +1709,7 @@ export async function getHostUpgradeInventory(): Promise<HostUpgradeInventory[]>
 }
 
 /** Every machine, including this one, checks on its daemon. Never fall back to the web server's installation. */
-export async function getHostSoftwareUpdates(id: string, force = false, compatibility: HostUpdateCompatibility = updateCompatibility(), releasePin?: ApprovedReleasePin): Promise<HostUpdateInfo> {
+export async function getHostSoftwareUpdates(id: string, force = false, compatibility: HostUpdateCompatibility = updateCompatibility(), releasePin?: ApprovedReleasePin, requireTwoPhase = false): Promise<HostUpdateInfo> {
   requireUpdateHost(id);
   if (releasePin) releasePin = validateApprovedReleasePin(releasePin);
   const current = updateCompatibility();
@@ -1720,6 +1731,12 @@ export async function getHostSoftwareUpdates(id: string, force = false, compatib
   }
   const recovery = observeLegacyUpgrade(id, info);
   if (recovery && (recovery.state === "running" || info.operation?.id === recovery.id || !info.operation)) info.operation = recovery;
+  const activeRecovery = linkFor(id).recovery;
+  if (activeRecovery?.phase && info.operation?.id === activeRecovery.id && info.operation.state !== "running") {
+    activeRecovery.phase = undefined;
+    void request(id, "close", { ch: activeRecovery.channel }, linkTimings.opTimeoutMs, undefined, activeRecovery.id)
+      .catch(() => {}).finally(() => { if (linkFor(id).recovery === activeRecovery) linkFor(id).recovery = undefined; });
+  }
   // Old daemons have no force contract. Only explicitly approved recovery may use their execution channel.
   if (id === LOCAL_HOST_ID && info.ompweb.canForceUpdate === undefined && !info.operation) info.operation = getHostUpdateOperation(); // an old daemon cannot report the recovery that is replacing it
   if (info.ompweb.canForceUpdate === undefined && info.ompweb.updateAvailable && info.operation?.state !== "running") {
@@ -1744,7 +1761,7 @@ export async function getHostSoftwareUpdates(id: string, force = false, compatib
       }
     }
   }
-  if (releasePin && info.ompweb.supportsReleasePin !== true && info.ompweb.updateAvailable && info.operation?.state !== "running") {
+  if (releasePin && (info.ompweb.supportsReleasePin !== true || requireTwoPhase && info.ompweb.supportsTwoPhaseUpdate !== true) && info.ompweb.updateAvailable && info.operation?.state !== "running") {
     const candidate = info.ompweb;
     const prohibited = candidate.blockers?.some((blocker) => !blocker.forceable);
     const eligible = !prohibited && (candidate.canUpdate || candidate.canForceUpdate);
@@ -1772,34 +1789,45 @@ export async function getHostSoftwareUpdates(id: string, force = false, compatib
   return info;
 }
 
-export async function updateHostSoftware(id: string, target: HostUpdateTarget, version: string, options: { force?: boolean; compatibility?: HostUpdateCompatibility; operationId?: string; releasePin?: ApprovedReleasePin; requireReleasePin?: boolean } = {}): Promise<{ accepted: true; operation: HostUpdateOperation }> {
+export async function updateHostSoftware(id: string, target: HostUpdateTarget, version: string, options: { force?: boolean; compatibility?: HostUpdateCompatibility; operationId?: string; releasePin?: ApprovedReleasePin; requireReleasePin?: boolean; phase?: "prepare" | "commit" | "cancel" } = {}): Promise<{ accepted: true; operation: HostUpdateOperation }> {
   const compatibility = options.compatibility ?? updateCompatibility();
   if (options.requireReleasePin && !options.releasePin) throw new HostOpError(400, "invalid_request", "Missing approved release pin");
   if (options.releasePin) options.releasePin = validateApprovedReleasePin(options.releasePin, version);
-  const checked = await getHostSoftwareUpdates(id, true, compatibility, options.releasePin);
-  if (!options.releasePin && options.operationId && checked.operation?.id === options.operationId && checked.operation.target === target && checked.operation.version === version) {
-    return { accepted: true, operation: checked.operation };
+  if (options.phase !== undefined && (!["prepare", "commit", "cancel"].includes(options.phase) || !options.operationId || !options.releasePin || !options.requireReleasePin)) throw new HostOpError(400, "invalid_request", "Coordinated phases require an operation identity and approved artifacts");
+  const checked = await getHostSoftwareUpdates(id, true, compatibility, options.releasePin, options.phase !== undefined);
+  const matching = options.operationId && checked.operation?.id === options.operationId && checked.operation.target === target && checked.operation.version === version;
+  if (!options.phase && !options.releasePin && matching) {
+    return { accepted: true, operation: checked.operation! };
   }
   const candidate = checked[target];
-  if (!candidate.updateAvailable || !(options.force ? candidate.canForceUpdate || candidate.canUpdate : candidate.canUpdate) || candidate.availableVersion !== version) {
+  if (!matching && (!candidate.updateAvailable || !(options.force ? candidate.canForceUpdate || candidate.canUpdate : candidate.canUpdate) || candidate.availableVersion !== version)) {
     throw new HostOpError(409, "host_update_blocked", candidate.blockedReason ?? "The available version changed; check for updates again");
   }
   const link = linkFor(id);
-  if (options.force && candidate.forceMethod === "recovery" && id === LOCAL_HOST_ID) {
-    try { return await startHostRecovery({ operationId: options.operationId ?? randomUUID(), version, compatibility, force: true, releasePin: options.releasePin, requireReleasePin: options.requireReleasePin }); }
+  const recovery = candidate.forceMethod === "recovery" || options.phase !== undefined && candidate.supportsTwoPhaseUpdate !== true;
+  if (recovery && !options.force) throw new HostOpError(409, "host_update_blocked", "This host requires explicitly approved recovery");
+  if (options.force && recovery && id === LOCAL_HOST_ID) {
+    try { return await startHostRecovery({ operationId: options.operationId ?? randomUUID(), version, compatibility, force: true, releasePin: options.releasePin, requireReleasePin: options.requireReleasePin, phase: options.phase }); }
     catch (error) { throw error instanceof HostRecoveryRefusal ? new HostOpError(error.httpStatus, error.code, error.message) : error; }
   }
-  if (options.force && candidate.forceMethod === "recovery") {
+  if (options.force && recovery) {
     return startLegacyUpgrade({
       hostId: id, version, compatibility, platform: link.platform || "",
       operationId: options.operationId,
       releasePin: options.releasePin, requireReleasePin: options.requireReleasePin,
+      phase: options.phase,
       transport: {
         async open(operationId) {
           const home = link.recoveryHome;
           if (!home || !(link.platform === "win32" ? win32.isAbsolute(home) : posix.isAbsolute(home))) throw new HostOpError(409, "recovery_unavailable", "The host did not advertise a usable recovery directory");
-          link.recovery = { id: operationId, lines: new Set() };
-          const result = await request(id, "open", { sessionId: null, launch: {
+          if (link.recovery?.id === operationId && link.recovery.channel) {
+            link.recovery.phase = options.phase;
+            link.recovery.requestId = options.phase === "commit" ? "2" : options.phase === "cancel" ? "3" : "1";
+            return link.recovery.channel;
+          }
+          link.recovery = { id: operationId, lines: new Set(), phase: options.phase,
+            requestId: options.phase === "commit" ? "2" : options.phase === "cancel" ? "3" : "1" };
+          const result = await request(id, "open", { sessionId: null, ...(options.phase ? { preparing: true } : {}), launch: {
             creationId: operationId, cwd: home, recordedCwd: null, sessionFile: "", toolNames: [], advisor: false,
           } }, LINK_LIMITS.channelReadyMs + linkTimings.opTimeoutMs, undefined, operationId);
           if (!isOpenResult(result)) throw new HostOpError(502, "host_bad_result", "The host returned an invalid recovery channel");
@@ -1820,6 +1848,7 @@ export async function updateHostSoftware(id: string, target: HostUpdateTarget, v
     ...(compatibility.min !== current.min || compatibility.max !== current.max ? { targetCompatibility: compatibility } : {}),
     ...(options.force ? { force: true } : {}), ...(options.operationId ? { operationId: options.operationId } : {}),
     ...(options.releasePin ? { releasePin: options.releasePin, requireReleasePin: true } : {}),
+    ...(options.phase ? { phase: options.phase } : {}),
   });
   if (!isRecord(result) || result.accepted !== true || !updateOperation(result.operation)
     || result.operation.target !== target || result.operation.version !== version) {

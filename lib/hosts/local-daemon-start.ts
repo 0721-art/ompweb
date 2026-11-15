@@ -6,6 +6,7 @@ import { isActiveLease, leasePath, readStateJson, statusPath, type StoredStatus 
 import { launchDetachedUpgrade, type UpgradeLaunch } from "../upgrade-process";
 import { requestHostControl, type HostControlStatus } from "./host-control";
 import { ensureLocalHostLink, localLinkUrl } from "./local-bootstrap";
+import { inspectInstalledHostSupervisor, type InstalledHostSupervisor } from "./local-daemon-supervisor";
 import { getHostUpdateOperation } from "./updates";
 
 export interface LocalDaemonOptions {
@@ -13,6 +14,8 @@ export interface LocalDaemonOptions {
   env?: NodeJS.ProcessEnv;
   /** The host command; defaults to this install's host. Tests use it to run a fake host. */
   launch?: UpgradeLaunch;
+  /** Native supervisor discovery seam used by platform-independent startup tests. */
+  inspectSupervisor?: () => Promise<InstalledHostSupervisor | null>;
 }
 
 export interface LocalDaemonResult {
@@ -22,8 +25,6 @@ export interface LocalDaemonResult {
   skipped?: string;
 }
 
-/** A supervisor that is still starting binds the control endpoint within seconds: wait for it rather than run a duplicate. */
-const SUPERVISOR_GRACE_MS = 5_000;
 /** A cold start loads the daemon's modules before it binds; the update worker allows its replacement the same time. */
 const START_TIMEOUT_MS = 30_000;
 /** A host that lost the singleton race exits while the winner is still binding: give the winner this long. */
@@ -74,8 +75,7 @@ function updateInProgress(): string | null {
 }
 
 /** Waits until the launched daemon answers, or fails with a reason: it exited, or it did not answer in time. Never waits forever. */
-async function awaitHost(pid: number | undefined, launch: UpgradeLaunch): Promise<HostControlStatus> {
-  const described = `${launch.command} ${launch.args.join(" ")}`;
+async function awaitHost(pid: number | undefined, described: string): Promise<HostControlStatus> {
   const deadline = Date.now() + START_TIMEOUT_MS;
   let exitedAt: number | undefined;
   let last: unknown;
@@ -94,20 +94,29 @@ async function awaitHost(pid: number | undefined, launch: UpgradeLaunch): Promis
   }
 }
 
-async function startLocalHostDaemon({ env = process.env, launch }: LocalDaemonOptions): Promise<LocalDaemonResult> {
+async function startLocalHostDaemon({ env = process.env, launch, inspectSupervisor }: LocalDaemonOptions): Promise<LocalDaemonResult> {
   if (env.NODE_ENV === "development") return { started: false, skipped: "the development server does not start the local daemon" };
   const target = localLinkUrl(env);
   if ("skip" in target) return { started: false, skipped: target.skip };
   // The daemon reads host.json as it starts, so the link is prepared before any probe or launch.
   await ensureLocalHostLink({ url: target.url });
-  const graceEnds = Date.now() + SUPERVISOR_GRACE_MS;
-  for (;;) {
-    const running = await probe();
-    if (running) return { started: false, pid: running.pid };
-    const busy = updateInProgress();
-    if (busy) return { started: false, skipped: busy };
-    if (Date.now() >= graceEnds) break;
-    await sleep(PROBE_INTERVAL_MS);
+  const running = await probe();
+  if (running) return { started: false, pid: running.pid };
+  const busy = updateInProgress();
+  if (busy) return { started: false, skipped: busy };
+  const supervisor = inspectSupervisor
+    ? await inspectSupervisor()
+    : await inspectInstalledHostSupervisor({ env });
+  const newlyBusy = updateInProgress();
+  if (newlyBusy) return { started: false, skipped: newlyBusy };
+  if (supervisor) {
+    try {
+      await supervisor.start();
+    } catch (error) {
+      throw new Error(`Could not start the local host through ${supervisor.description}: ${message(error)}`);
+    }
+    const status = await awaitHost(undefined, supervisor.description);
+    return { started: true, pid: status.pid };
   }
   const plan = launch ?? localHostLaunch(env);
   let pid: number | undefined;
@@ -116,7 +125,7 @@ async function startLocalHostDaemon({ env = process.env, launch }: LocalDaemonOp
   } catch (error) {
     throw new Error(`Could not start the local host (${plan.command}): ${message(error)}`);
   }
-  const status = await awaitHost(pid, plan);
+  const status = await awaitHost(pid, `${plan.command} ${plan.args.join(" ")}`);
   // When another starter won the singleton race, its daemon answers and this launch is not the host.
   return { started: pid === undefined || status.pid === pid, pid: status.pid };
 }

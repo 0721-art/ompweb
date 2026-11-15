@@ -74,8 +74,9 @@ function updateRequest(args: Record<string, unknown>): HostUpdateRequest {
   if (args.force !== undefined && typeof args.force !== "boolean") throw new HostOpError(400, "invalid_request", "force must be a boolean");
   if (args.operationId !== undefined && typeof args.operationId !== "string") throw new HostOpError(400, "invalid_request", "operationId must be a string");
   if (args.requireReleasePin !== undefined && typeof args.requireReleasePin !== "boolean" || args.requireReleasePin && !args.releasePin) throw new HostOpError(400, "invalid_request", "Missing approved release pin");
+  if (args.phase !== undefined && !["prepare", "commit", "cancel"].includes(String(args.phase))) throw new HostOpError(400, "invalid_request", "Invalid coordinated update phase");
   const releasePin = args.releasePin === undefined ? undefined : validateApprovedReleasePin(args.releasePin);
-  return { force: args.force === true, operationId: args.operationId, targetCompatibility: args.targetCompatibility === undefined ? undefined : updateCompatibility(args.targetCompatibility), releasePin, requireReleasePin: args.requireReleasePin as boolean | undefined };
+  return { force: args.force === true, operationId: args.operationId, targetCompatibility: args.targetCompatibility === undefined ? undefined : updateCompatibility(args.targetCompatibility), releasePin, requireReleasePin: args.requireReleasePin as boolean | undefined, phase: args.phase as HostUpdateRequest["phase"] };
 }
 
 /** Whether `command` names an executable: a path as given, else a name on PATH (with PATHEXT's extensions on Windows). */

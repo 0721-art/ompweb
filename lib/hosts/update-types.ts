@@ -38,6 +38,8 @@ export interface HostSoftwareUpdate {
   updateAvailable: boolean;
   canUpdate: boolean;
   supportsReleasePin?: boolean;
+  /** The daemon can stage and preflight without committing, then accept an operation-bound commit or cancellation. */
+  supportsTwoPhaseUpdate?: boolean;
   /** Every blocker, so a UI can tell forceable ones (see HostUpdateBlocker) from final ones. Empty when `canUpdate`. Absent from a daemon that predates force. */
   blockers?: HostUpdateBlocker[];
   /** An available update is blocked only by forceable blockers: an update request with `force` would be accepted, ending this host's sessions. Absent from a daemon that predates force; never infer it. */
@@ -56,6 +58,8 @@ export interface HostUpdateOperation {
   target: HostUpdateTarget | "omp";
   version: string;
   state: "running" | "succeeded" | "failed";
+  /** All candidate artifacts passed preflight; the worker is waiting for an explicit coordinated commit. */
+  prepared?: true;
   error?: string;
   /** A lifecycle mutation could not be reconciled. Keep the claim until manual recovery; never expire this into an ordinary failure. */
   recoveryRequired?: true;
@@ -79,6 +83,8 @@ export interface HostUpdateRequest {
   operationId?: string;
   releasePin?: ApprovedReleasePin;
   requireReleasePin?: boolean;
+  /** Coordinated updates stage every participant before any commit. Omitted for an ordinary one-step host update. */
+  phase?: "prepare" | "commit" | "cancel";
 }
 
 export interface HostUpdateInfo {

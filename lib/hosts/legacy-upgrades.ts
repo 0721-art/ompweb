@@ -20,6 +20,7 @@ interface LegacyUpgradeState {
   confirmedTerminal?: boolean;
   releasePin?: ApprovedReleasePin;
   requireReleasePin?: boolean;
+  phased?: true;
 }
 
 export interface LegacyUpgradeTransport {
@@ -62,7 +63,8 @@ function validState(value: unknown, hostId: string): value is LegacyUpgradeState
     || typeof value.helper.repo !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(value.helper.repo)
     || (value.helper.tag !== undefined && typeof value.helper.tag !== "string")
     || !Array.isArray(value.helper.assets) || typeof value.platform !== "string"
-    || (value.confirmedTerminal !== undefined && typeof value.confirmedTerminal !== "boolean")) return false;
+    || (value.confirmedTerminal !== undefined && typeof value.confirmedTerminal !== "boolean")
+    || (value.phased !== undefined && value.phased !== true)) return false;
   if (value.requireReleasePin !== undefined && typeof value.requireReleasePin !== "boolean" || value.requireReleasePin && !value.releasePin) return false;
   if (value.releasePin !== undefined) {
     try { validateApprovedReleasePin(value.releasePin, value.operation.version as string); } catch { return false; }
@@ -138,33 +140,74 @@ export async function startLegacyUpgrade(input: {
   operationId?: string;
   releasePin?: ApprovedReleasePin;
   requireReleasePin?: boolean;
+  phase?: "prepare" | "commit" | "cancel";
 }): Promise<{ accepted: true; operation: HostUpdateOperation }> {
   if (!HOST_VERSION_PATTERN.test(input.version)) throw new HostOpError(400, "invalid_version", "Invalid recovery target version");
-  if (input.requireReleasePin !== undefined && typeof input.requireReleasePin !== "boolean" || input.requireReleasePin && !input.releasePin) throw new HostOpError(400, "invalid_request", "Missing approved release pin");
+  if (input.phase !== undefined && !["prepare", "commit", "cancel"].includes(input.phase)) throw new HostOpError(400, "invalid_request", "Invalid recovery phase");
+  if (input.operationId !== undefined && !/^[a-f0-9-]{36}$/.test(input.operationId)) throw new HostOpError(400, "invalid_operation", "Invalid recovery operation identity");
+  if (input.phase !== undefined && (!input.operationId || input.requireReleasePin !== true || !input.releasePin)) throw new HostOpError(400, "invalid_request", "Phased recovery requires an operation id and approved release pin");
+  if ((input.requireReleasePin !== undefined && typeof input.requireReleasePin !== "boolean") || (input.requireReleasePin && !input.releasePin)) throw new HostOpError(400, "invalid_request", "Missing approved release pin");
   const releasePin = input.releasePin === undefined ? undefined : validateApprovedReleasePin(input.releasePin, input.version);
   const previous = readLegacyUpgrade(input.hostId);
-  if (previous && input.operationId === previous.operation.id && (JSON.stringify(previous.releasePin) !== JSON.stringify(releasePin) || !!previous.requireReleasePin !== !!input.requireReleasePin)) throw new HostOpError(409, "operation_conflict", "This recovery operation already names different approved artifacts");
+  const same = previous !== null && previous.operation.id === input.operationId;
+  if (previous && same && (previous.operation.version !== input.version
+    || previous.platform !== input.platform
+    || previous.compatibility.min !== input.compatibility.min
+    || previous.compatibility.max !== input.compatibility.max
+    || JSON.stringify(previous.releasePin) !== JSON.stringify(releasePin)
+    || !!previous.requireReleasePin !== !!input.requireReleasePin)) {
+    throw new HostOpError(409, "operation_conflict", "This recovery operation already names different immutable parameters");
+  }
+  if (input.phase && previous && same && !previous.phased) throw new HostOpError(409, "operation_conflict", "This operation was not started as a phased recovery");
+
+  const dispatch = async (state: LegacyUpgradeState): Promise<void> => {
+    const command = buildLegacyRecoveryBootstrap({
+      operationId: state.operation.id, helper: state.helper, targetVersion: state.operation.version,
+      compatibility: state.compatibility, platform: state.platform, force: true,
+      releasePin: state.releasePin, requireReleasePin: state.requireReleasePin, phase: input.phase,
+    });
+    try {
+      const channel = await input.transport.open(state.operation.id);
+      input.transport.send(channel, legacyRecoveryEnvelopes(command, input.phase === "commit" ? 2 : input.phase === "cancel" ? 3 : 1));
+    } catch (error) {
+      // A transport loss may follow execution. Keep the claim until an authenticated receipt resolves the uncertainty.
+      if (error instanceof HostOpError && [400, 403, 404, 409, 501].includes(error.status)) {
+        state.operation = { ...state.operation, state: "failed", error: error.message };
+        state.confirmedTerminal = true;
+        writeState(state);
+        releaseClaim(input.hostId, state.operation.id);
+        throw error;
+      }
+      state.operation.error = "The recovery request lost its response; waiting for the host's authenticated update receipt";
+      writeState(state);
+    }
+  };
+
+  if (previous?.operation.state === "running") {
+    if (!same) throw new HostOpError(409, "update_in_progress", "This host already has a recovery operation; reconcile its status before starting another");
+    if (input.phase === "commit" && previous.operation.prepared !== true) throw new HostOpError(409, "operation_not_prepared", "This recovery operation has not authenticated a prepared state");
+    if (!input.phase) return { accepted: true, operation: previous.operation };
+    await dispatch(previous);
+    return { accepted: true, operation: previous.operation };
+  }
+  if (input.phase && previous && same) return { accepted: true, operation: previous.operation };
+  if (input.phase === "commit" || input.phase === "cancel") throw new HostOpError(409, "unknown_operation", `Cannot ${input.phase} an unknown phased recovery operation`);
+
   const admission = join(directory(input.hostId), "lock.json");
   if (existsSync(admission)) {
     assertOwnedPath(admission);
     const claim: unknown = JSON.parse(readFileSync(admission, "utf8"));
     if (!isRecord(claim) || typeof claim.id !== "string") throw new HostOpError(500, "invalid_recovery_state", "Stored recovery claim is invalid");
     const recorded = previous?.operation.id === claim.id;
-    const incomplete = !recorded || previous.operation.state !== "running";
     const abandoned = Number.isSafeInteger(claim.pid) && Number(claim.pid) > 1
       ? !isProcessAlive(Number(claim.pid))
       : Date.now() - lstatSync(admission).mtimeMs > RECOVERY_LEASE_MS;
-    if (incomplete && ((recorded && previous.confirmedTerminal) || abandoned)) releaseClaim(input.hostId, claim.id);
-    else if (!recorded || previous.operation.state !== "running") throw new HostOpError(409, "update_in_progress", "Another recovery admission is in progress");
-  }
-  if (previous?.operation.state === "running") {
-    if (input.operationId && previous.operation.id === input.operationId && previous.operation.version === input.version) return { accepted: true, operation: previous.operation };
-    throw new HostOpError(409, "update_in_progress", "This host already has a recovery operation; reconcile its status before starting another");
+    if ((recorded && previous.confirmedTerminal) || abandoned) releaseClaim(input.hostId, claim.id);
+    else throw new HostOpError(409, "update_in_progress", "Another recovery admission is in progress");
   }
   const helper = await recoveryHelperRelease();
   const id = input.operationId ?? randomUUID();
   if (!/^[a-f0-9-]{36}$/.test(id)) throw new HostOpError(400, "invalid_operation", "Invalid recovery operation identity");
-  const command = buildLegacyRecoveryBootstrap({ operationId: id, helper, targetVersion: input.version, compatibility: input.compatibility, platform: input.platform, force: true, releasePin, requireReleasePin: input.requireReleasePin });
   const root = directory(input.hostId, true);
   const lock = join(root, "lock.json");
   try { writeFileSync(lock, JSON.stringify({ id, pid: process.pid, at: Date.now() }), { flag: "wx", mode: 0o600 }); }
@@ -175,24 +218,10 @@ export async function startLegacyUpgrade(input: {
   const state: LegacyUpgradeState = {
     hostId: input.hostId, operation: { id, target: "ompweb", version: input.version, state: "running" },
     helper, compatibility: input.compatibility, platform: input.platform, startedAt: Date.now(),
-    releasePin, requireReleasePin: input.requireReleasePin,
+    releasePin, requireReleasePin: input.requireReleasePin, ...(input.phase ? { phased: true as const } : {}),
   };
   try { writeState(state); }
   catch (error) { releaseClaim(input.hostId, id); throw error; }
-  try {
-    const channel = await input.transport.open(id);
-    input.transport.send(channel, legacyRecoveryEnvelopes(command, 1));
-  } catch (error) {
-    // A transport loss may follow execution. Keep the claim until an authenticated receipt resolves the uncertainty.
-    if (error instanceof HostOpError && [400, 403, 404, 409, 501].includes(error.status)) {
-      state.operation = { ...state.operation, state: "failed", error: error.message };
-      state.confirmedTerminal = true;
-      writeState(state);
-      releaseClaim(input.hostId, id);
-      throw error;
-    }
-    state.operation.error = "The recovery request lost its response; waiting for the host's authenticated update receipt";
-    writeState(state);
-  }
+  await dispatch(state);
   return { accepted: true, operation: state.operation };
 }

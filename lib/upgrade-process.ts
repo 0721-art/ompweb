@@ -346,7 +346,7 @@ async function systemdUnit(unit: string, user: boolean): Promise<{ props: Record
   const files = [props.FragmentPath, ...(props.DropInPaths ? props.DropInPaths.split(" ") : [])].filter(Boolean);
   return { props, execs, hash: sha256(unit, props.FragmentPath, props.DropInPaths ?? "", ...EXEC_KEYS.map((key) => (execs[key] ?? []).join("\n")), ...files.map(fileDigest)) };
 }
-async function inspectSystemd(me: ProcessInfo, rows: ProcessInfo[], role: UpgradeProcess["role"]): Promise<UpgradeSupervisor | null> {
+async function inspectSystemd(me: ProcessInfo, rows: ProcessInfo[], role: UpgradeProcess["role"], installDir: string): Promise<UpgradeSupervisor | null> {
   const service = cgroupService(me.pid);
   if (!service) return null;
   if (!UNIT_NAME.test(service.unit)) fail(`Unsupported systemd unit name ${service.unit}`);
@@ -359,6 +359,9 @@ async function inspectSystemd(me: ProcessInfo, rows: ProcessInfo[], role: Upgrad
   const main = Number(props.MainPID);
   const byPid = new Map(rows.map((row) => [row.pid, row]));
   if (!main || !ancestry(byPid, me, 16).some((row) => row.pid === main)) fail(`${service.unit}'s main process is neither this process nor one of its parents`);
+  if (ancestry(byPid, me, 16).slice(1).some((row) => isHostCommand(row.args) && !SHELL.test(basename(row.args[0] ?? row.exe)) && !belongsToInstall(row, installDir))) {
+    fail(`${service.unit} manages another host installation; refusing to stop its service for a descendant process`);
+  }
   if ((execs.ExecStart ?? []).length !== 1) fail(`${service.unit} must have exactly one ExecStart command`);
   assertTrustedFile(execs.ExecStart[0].split("\0")[0], `${service.unit}'s ExecStart program`);
   return { kind: "systemd", unit: service.unit, user: service.user, configHash: hash };
@@ -372,26 +375,41 @@ async function verifySystemd(sup: Extract<UpgradeSupervisor, { kind: "systemd" }
 // ---------------------------------------------------------------- launchd and restart loops (macOS, POSIX shells)
 
 async function launchctl(args: string[]): Promise<string> {
-  try { return (await exec("launchctl", args, { timeout: 20000, maxBuffer: 4 * MIB, encoding: "utf8" })).stdout; }
+  try { return (await exec("launchctl", args, { timeout: 20000, maxBuffer: 16 * MIB, encoding: "utf8" })).stdout; }
   catch (error) { return fail(`launchctl ${args[0]} failed: ${messageOf(error)}`); }
 }
 function launchdJob(printed: string): { plist: string; pid: number | null } {
   return { plist: printed.match(/^\s*path = (.+)$/m)?.[1]?.trim() ?? "", pid: Number(printed.match(/^\s*pid = (\d+)$/m)?.[1]) || null };
 }
 function launchdDomain(): string { return `gui/${process.getuid?.() ?? 0}`; }
+function launchdUserDomain(): string { return `user/${process.getuid?.() ?? 0}`; }
+function launchdLabel(printed: string, pid: number): string | null {
+  const services = printed.match(/^\s*services = \{\s*$([\s\S]*?)^\s*\}\s*$/m)?.[1];
+  if (services === undefined) fail("Cannot read launchd's service inventory; refusing to assume the process is unsupervised");
+  return services.split("\n").map((line) => line.match(/^\s*(\d+)\s+\S+\s+(\S+)\s*$/)).find((match) => match && Number(match[1]) === pid)?.[2] ?? null;
+}
+async function printLaunchdDomain(domain: string): Promise<string | null> {
+  try { return await launchctl(["print", domain]); }
+  catch (error) {
+    if (domain !== "system" && /could not find domain|no such process/i.test(messageOf(error))) return null;
+    throw error;
+  }
+}
 async function inspectLaunchd(me: ProcessInfo): Promise<UpgradeSupervisor | null> {
-  const label = (await launchctl(["list"])).split("\n").map((line) => line.match(/^(\d+)\s+-?\d+\s+(\S+)\s*$/)).find((match) => match && Number(match[1]) === me.pid)?.[2];
-  // shortcut: a system-domain LaunchDaemon running as this user is invisible here; the host's singleton lock still refuses a second daemon.
-  if (!label) return null;
-  if (!LAUNCHD_LABEL.test(label)) fail(`Unsupported launchd label ${label}`);
-  const domain = launchdDomain();
-  const job = launchdJob(await launchctl(["print", `${domain}/${label}`]));
-  if (!job.plist || job.pid !== me.pid) fail(`launchd job ${label} does not run process ${me.pid} from a property list`);
-  assertTrustedFile(job.plist, "launchd property list");
-  return { kind: "launchd", label, domain, plist: job.plist, configHash: sha256(label, domain, job.plist, fileDigest(job.plist)) };
+  for (const domain of ["system", launchdDomain(), launchdUserDomain()]) {
+    const printed = await printLaunchdDomain(domain);
+    if (!printed) continue;
+    const label = launchdLabel(printed, me.pid);
+    if (!label) continue;
+    if (!LAUNCHD_LABEL.test(label)) fail(`Unsupported launchd label ${label}`);
+    const job = launchdJob(await launchctl(["print", `${domain}/${label}`]));
+    if (!job.plist || job.pid !== me.pid) fail(`launchd job ${label} does not run process ${me.pid} from a property list`);
+    assertTrustedFile(job.plist, "launchd property list");
+    return { kind: "launchd", label, domain, plist: job.plist, configHash: sha256(label, domain, job.plist, fileDigest(job.plist)) };
+  }
+  return null;
 }
 async function verifyLaunchd(sup: Extract<UpgradeSupervisor, { kind: "launchd" }>): Promise<{ loaded: boolean; pid: number | null }> {
-  if (sup.domain !== launchdDomain()) fail("The launchd job belongs to another user's domain");
   if (sha256(sup.label, sup.domain, sup.plist, fileDigest(sup.plist)) !== sup.configHash) fail(`The property list of ${sup.label} changed since it was inspected; refusing to control it`);
   try { return { loaded: true, pid: launchdJob(await launchctl(["print", `${sup.domain}/${sup.label}`])).pid }; }
   catch { return { loaded: false, pid: null }; } // `print` fails when the job is not loaded
@@ -401,8 +419,11 @@ async function inspectPosixSupervisor(me: ProcessInfo, rows: ProcessInfo[], inst
   const byPid = new Map(rows.map((row) => [row.pid, row]));
   let parent = byPid.get(me.ppid);
   if (!parent || me.ppid <= 1) {
-    if (process.platform === "darwin" && me.ppid === 1) { const job = await inspectLaunchd(me); if (job) return job; }
-    return { kind: "foreground" }; // reparented to init after its starter exited: nothing supervises it
+    if (process.platform === "darwin" && me.ppid === 1) {
+      const job = await inspectLaunchd(me);
+      if (job) return job;
+    }
+    return { kind: "foreground" }; // launchd domains were inspected; this was reparented after its starter exited
   }
   // A subshell shares the loop's command line: the loop is the outermost of them.
   for (let up = byPid.get(parent.ppid); up && up.args.length > 0 && up.args.join("\0") === parent.args.join("\0"); up = byPid.get(parent.ppid)) parent = up;
@@ -612,7 +633,7 @@ function assertPlan(plan: UpgradeProcess): void {
   switch (s.kind) {
     case "foreground": break;
     case "systemd": if (!UNIT_NAME.test(s.unit) || typeof s.user !== "boolean" || !text(s.configHash)) bad("systemd supervisor"); break;
-    case "launchd": if (!LAUNCHD_LABEL.test(s.label) || s.domain !== `gui/${process.getuid?.() ?? 0}` || !text(s.plist) || !isAbsolute(s.plist) || !text(s.configHash)) bad("launchd supervisor"); break;
+    case "launchd": if (!LAUNCHD_LABEL.test(s.label) || !["system", launchdDomain(), launchdUserDomain()].includes(s.domain) || !text(s.plist) || !isAbsolute(s.plist) || !text(s.configHash)) bad("launchd supervisor"); break;
     case "restart-loop": if (!Number.isSafeInteger(s.pid) || s.pid <= 1 || !text(s.identity) || !text(s.script) || !isAbsolute(s.script) || !text(s.configHash)) bad("restart-loop supervisor"); break;
     case "windows-service": if (!text(s.name) || !text(s.configHash)) bad("windows service supervisor"); break;
     case "windows-task": if (!text(s.path) || !text(s.name) || !Array.isArray(s.scripts) || !s.scripts.every(text) || !text(s.configHash)) bad("windows task supervisor"); break;
@@ -707,10 +728,16 @@ export async function assertUpgradeProcessControl(plan: UpgradeProcess): Promise
       fail(`Cannot verify non-root stop and start authorization for system unit ${sup.unit} without changing service state; use your own user unit or an elevated service to perform the update`);
     }
     case "launchd": {
-      if (process.getuid?.() === undefined || process.getuid?.() !== process.geteuid?.() || sup.domain !== launchdDomain()) fail("Cannot prove control of another launchd domain");
       assertTrustedFile(sup.plist, "launchd property list");
       const job = await verifyLaunchd(sup);
       if (!job.loaded || (pid !== null && job.pid !== pid)) fail("Cannot prove control of the inspected launchd job");
+      if (sup.domain === "system") {
+        if (process.geteuid?.() === 0) return;
+        fail(`Cannot verify non-root stop and start authorization for system launchd job ${sup.label} without changing service state; use a user LaunchAgent or an elevated service to perform the update`);
+      }
+      if (process.getuid?.() === undefined || process.getuid?.() !== process.geteuid?.() || sup.domain !== launchdDomain()) {
+        fail(sup.domain === launchdUserDomain() ? `Cannot prove stop and start authorization for user-domain launchd job ${sup.label}; install it as a GUI LaunchAgent or control it manually` : "Cannot prove control of another launchd domain");
+      }
       await launchctl(["print", sup.domain]);
       return;
     }
@@ -757,7 +784,7 @@ export async function inspectUpgradeProcess(input: { pid: number; installDir: st
   if (isHostCommand(me.args) !== (role === "host")) fail(`Process ${pid} is not the ${role} process (${me.args.slice(0, 4).join(" ")})`);
   let supervisor: UpgradeSupervisor;
   if (process.platform === "win32") supervisor = await inspectWindowsSupervisor(me, rows, installDir);
-  else supervisor = (process.platform === "linux" ? await inspectSystemd(me, rows, role) : null) ?? await inspectPosixSupervisor(me, rows, installDir);
+  else supervisor = (process.platform === "linux" ? await inspectSystemd(me, rows, role, installDir) : null) ?? await inspectPosixSupervisor(me, rows, installDir);
   if (supervisor.kind === "foreground") {
     // The restart path is checked while nothing is stopped yet.
     try { if (!statSync(launch.cwd).isDirectory()) throw new Error("not a directory"); } catch { fail(`The restart working directory ${launch.cwd} is not a directory`); }
