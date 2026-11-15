@@ -94,9 +94,10 @@ export interface GithubTarget {
   owner: string;
   repo: string;
   number: number;
+  kind?: "workflow_run";
 }
 
-const TARGET_ERROR = 'Agent tool argument "target" must be OWNER/REPO#N or a GitHub pull request or issue URL.';
+const TARGET_ERROR = 'Agent tool argument "target" must be OWNER/REPO#N or a GitHub pull request, issue or workflow run URL.';
 // GitHub owners are alphanumeric with hyphens. Repos may start with dots,
 // but "." and ".." are path segments, not repository names.
 const OWNER = /^[A-Za-z0-9-]+$/;
@@ -108,7 +109,7 @@ function validTarget(owner: string, repo: string, number: number): GithubTarget 
   return { owner, repo, number };
 }
 
-/** `OWNER/REPO#N`, or a github.com pull request or issue URL (trailing path, query and fragment ignored). */
+/** GitHub item references; workflow runs always use their canonical URL as a key. */
 export function parseGithubTarget(value: string): GithubTarget {
   const text = value.trim();
   const short = SHORT_FORM.exec(text);
@@ -120,11 +121,19 @@ export function parseGithubTarget(value: string): GithubTarget {
   } catch {
     throw new Error(TARGET_ERROR);
   }
+  if (url.protocol !== "https:" || url.hostname !== "github.com" || url.username || url.password || url.port) throw new Error(TARGET_ERROR);
+  const run = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9]\d*)(?:\/|$)/.exec(url.pathname);
+  if (run) {
+    const number = Number(run[3]);
+    if (!Number.isSafeInteger(number)) throw new Error(TARGET_ERROR);
+    return { ...validTarget(run[1], run[2], number), kind: "workflow_run" };
+  }
   const path = /^\/([^/]+)\/([^/]+)\/(pull|issues)\/([1-9]\d{0,9})(?:\/|$)/.exec(url.pathname);
-  if (url.protocol !== "https:" || url.hostname !== "github.com" || !path) throw new Error(TARGET_ERROR);
+  if (!path) throw new Error(TARGET_ERROR);
   return validTarget(path[1], path[2], Number(path[4]));
 }
 
 export function formatTarget(target: GithubTarget): string {
+  if (target.kind === "workflow_run") return `https://github.com/${target.owner}/${target.repo}/actions/runs/${target.number}`;
   return `${target.owner}/${target.repo}#${target.number}`;
 }

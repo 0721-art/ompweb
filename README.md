@@ -87,6 +87,21 @@ session you are viewing. Clicking a notification opens its session.
 Completion notifications use the `ompweb-omp` channel's `prompt_result` and
 `session_settled` frames.
 
+## GitHub agent tools
+
+With **Agent tools** enabled and `gh` logged in on the web server, agents can
+watch pull requests, issues and specific GitHub Actions runs. Pass a run URL such
+as `https://github.com/OWNER/REPO/actions/runs/ID` to `watch_github`; status and
+attempt changes arrive in the session, followed by the final conclusion. The
+watch ends after completion. Runs that already completed are not registered.
+Watches survive server restarts and use the existing 20-watch limit per session.
+
+Automatic updates contain metadata only, not workflow names, job names or logs.
+Use `github_read` with the same URL for run details (`include: ["summary"]`) or
+jobs (`include: ["checks"]`), and `unwatch_github` to stop watching. Run comments,
+other read parts, and subscriptions to future runs of a workflow are not supported.
+Remote sessions use the same per-repository read confirmation as PRs and issues.
+
 ## Quick Start
 
 **Run directly without installing:**

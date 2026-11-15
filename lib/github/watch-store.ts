@@ -44,7 +44,8 @@ export function repoKeyOf(target: { owner: string; repo: string }): string {
   return `${target.owner.toLowerCase()}/${target.repo.toLowerCase()}`;
 }
 
-export function itemKeyOf(target: { owner: string; repo: string; number: number }): string {
+export function itemKeyOf(target: { owner: string; repo: string; number: number; kind?: "workflow_run" }): string {
+  if (target.kind === "workflow_run") return `https://github.com/${repoKeyOf(target)}/actions/runs/${target.number}`;
   return `${repoKeyOf(target)}#${target.number}`;
 }
 
