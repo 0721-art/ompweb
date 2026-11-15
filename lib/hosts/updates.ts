@@ -12,6 +12,10 @@ import { isUpdateDisabled } from "../update-policy";
 import { parseSystemdServiceCgroup } from "../self-update";
 import type { HostSoftwareUpdate, HostUpdateCompatibility, HostUpdateInfo, HostUpdateOperation, HostUpdateTarget } from "./update-types";
 import { assertOwnedPath, ensureHostUpdateRoot, fetchHostUpdateBytes, finishHostUpdate, HOST_VERSION_PATTERN, hostReleaseName, hostUpdateRoot, installedHostVersionMatches, isHostUpdateProcessAlive, processStartIdentity, pruneHostUpdateArtifacts, readHostUpdateState, sharedHostInstallReason, verifyHostServiceInstall, writeHostUpdateJson, type HostUpdateDescriptor } from "./update-worker";
+import { checkCustomOmpUpdate, runCustomOmpUpdate } from "../omp/custom-updates";
+import { checkPrereleaseUpdate, parsePrereleaseTag } from "../ompweb-releases";
+import { isGithubTokenRejected } from "../github-fetch";
+import { readHostUpdateSettings, writeHostUpdateSettings, type HostUpdateSettings } from "./update-settings";
 
 const exec = promisify(execFile);
 const LEASE_MS = 15 * 60 * 1000;
@@ -35,7 +39,7 @@ export function getHostUpdateOperation(): HostUpdateOperation | null {
 }
 
 /** Called only after the new daemon's link is welcomed. Rollback daemons also acknowledge their old version. */
-export function acknowledgeHostUpdateHealth(): void {
+export async function acknowledgeHostUpdateHealth(): Promise<void> {
   try {
     const state = readHostUpdateState();
     if (state?.operation.state !== "running" || state.operation.target !== "ompweb" || state.daemonPid === process.pid) return;
@@ -44,21 +48,24 @@ export function acknowledgeHostUpdateHealth(): void {
     const path = join(attempt, "descriptor.json");
     assertOwnedPath(path);
     const descriptor = JSON.parse(readFileSync(path, "utf8")) as HostUpdateDescriptor;
-    if (descriptor.id !== state.operation.id || ![descriptor.version, descriptor.fromVersion].includes(packageJson.version)) return;
-    writeHostUpdateJson(join(attempt, "health.json"), { id: state.operation.id, version: packageJson.version, pid: process.pid });
+    const prerelease = parsePrereleaseTag(descriptor.version);
+    const version = prerelease && await installedHostVersionMatches("binary", installDirectory(), descriptor.version) ? descriptor.version : packageJson.version;
+    if (descriptor.id !== state.operation.id || ![descriptor.version, descriptor.fromVersion].includes(version)) return;
+    writeHostUpdateJson(join(attempt, "health.json"), { id: state.operation.id, version, pid: process.pid });
   } catch (error) { console.error("Could not acknowledge host update health:", messageOf(error)); }
 }
 
 function assertCompatibility(compatibility: HostUpdateCompatibility): void {
   if (!compatibility || !Number.isSafeInteger(compatibility.min) || !Number.isSafeInteger(compatibility.max) || compatibility.min < 1 || compatibility.max < compatibility.min) throw new HostUpdateError("invalid_compatibility", "Invalid server link protocol range", 400);
 }
-async function candidateProtocol(version: string, force: boolean): Promise<number | null> {
+async function candidateProtocol(version: string, force: boolean, token?: string): Promise<number | null> {
   if (!HOST_VERSION_PATTERN.test(version) || version.length > 100) return null;
   const cached = protocolCache.get(version);
   if (!force && cached && Date.now() - cached.checkedAt < (cached.value === null ? 30000 : 5 * 60 * 1000)) return cached.value;
   let value: number | null = null;
   try {
-    const source = (await fetchHostUpdateBytes(`https://raw.githubusercontent.com/kahme247/ompweb/v${version}/lib/hosts/link-protocol.ts`, 128 * 1024)).toString("utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+    const tag = parsePrereleaseTag(version) ? version : `v${version}`;
+    const source = (await fetchHostUpdateBytes(`https://raw.githubusercontent.com/kahme247/ompweb/${tag}/lib/hosts/link-protocol.ts`, 128 * 1024, 5000, token)).toString("utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
     const declarations = [...source.matchAll(/^export const LINK_PROTOCOL_VERSION\s*=\s*([1-9]\d*)\s*;\s*$/gm)];
     if (declarations.length === 1 && [...source.matchAll(/export\s+const\s+LINK_PROTOCOL_VERSION\b/g)].length === 1) {
       const parsed = Number(declarations[0][1]);
@@ -200,24 +207,29 @@ async function planHostUpdate(method: "npm" | "bun" | "binary", version: string)
   return plan;
 }
 
-export async function checkHostUpdates(compatibility: HostUpdateCompatibility, force = false): Promise<HostUpdateInfo> {
+export async function checkHostUpdates(compatibility: HostUpdateCompatibility, force = false, token?: string): Promise<HostUpdateInfo> {
   assertCompatibility(compatibility);
   const operation = getHostUpdateOperation();
   const disabled = isUpdateDisabled() ? "Updates are disabled by OMP_WEB_DISABLE_AUTOUPDATE" : null;
-  const [npmResult, ompResult] = await Promise.allSettled([checkNpmUpdate(force), checkOmpUpdate(force)]);
+  const settings = readHostUpdateSettings();
+  const [npmResult, ompResult] = await Promise.allSettled([
+    settings.ompwebChannel === "prerelease" ? checkPrereleaseUpdate(force, token) : checkNpmUpdate(force),
+    settings.ompSource === "custom" ? checkCustomOmpUpdate(settings.ompRepository, token) : checkOmpUpdate(force),
+  ]);
   const base: HostSoftwareUpdate = { currentVersion: null, availableVersion: null, updateAvailable: false, canUpdate: false, blockedReason: null, updateCommand: "" };
   const npm = npmResult.status === "fulfilled" ? npmResult.value : null;
   const omp = ompResult.status === "fulfilled" ? ompResult.value : null;
   const installMethod = typeof Bun !== "undefined" && Bun.isStandaloneExecutable ? "binary" : detectInstallMethod(installDirectory());
   const ompweb: HostUpdateInfo["ompweb"] = { ...base, ...npm, currentVersion: packageJson.version, installMethod, protocolVersion: null, updateCommand: installMethod === "binary" ? "https://github.com/kahme247/ompweb/releases/latest" : installMethod === "bun" ? "bun add -g @kahme247/ompweb" : "npm install -g @kahme247/ompweb" };
-  const runtime: HostUpdateInfo["omp"] = { ...base, ...omp, updateCommand: "omp update", updatesDisabled: Boolean(disabled) };
+  const runtime: HostUpdateInfo["omp"] = { ...base, ...omp, updateCommand: settings.ompSource === "custom" ? `https://github.com/${settings.ompRepository}/releases/latest` : "omp update", updatesDisabled: Boolean(disabled) };
   if (disabled) ompweb.blockedReason = runtime.blockedReason = disabled;
   else {
     if (!npm || !npm.availableVersion || !HOST_VERSION_PATTERN.test(npm.availableVersion)) ompweb.blockedReason = "Could not check the host's ompweb update version";
     else if (npm.updateAvailable) {
-      ompweb.protocolVersion = await candidateProtocol(npm.availableVersion, force);
+      ompweb.protocolVersion = await candidateProtocol(npm.availableVersion, force, token);
       if (ompweb.protocolVersion === null) ompweb.blockedReason = "The candidate's daemon link protocol could not be verified; update is blocked";
       else if (ompweb.protocolVersion < compatibility.min || ompweb.protocolVersion > compatibility.max) ompweb.blockedReason = `Update the web server first: this release uses daemon protocol ${ompweb.protocolVersion}, but the server supports ${compatibility.min}–${compatibility.max}`;
+      else if (settings.ompwebChannel === "prerelease" && installMethod !== "binary") ompweb.blockedReason = "Pre-release updates require an ompweb binary installation";
       else if (operation?.state !== "running") ompweb.blockedReason = (await planHostUpdate(installMethod, npm.availableVersion)).blockedReason;
       ompweb.canUpdate = ompweb.blockedReason === null;
     }
@@ -227,7 +239,7 @@ export async function checkHostUpdates(compatibility: HostUpdateCompatibility, f
   if (operation?.state === "running") {
     for (const software of [ompweb, runtime]) { software.canUpdate = false; software.blockedReason ??= "Another host update is in progress"; }
   }
-  return { ompweb, omp: runtime, operation };
+  return { ompweb, omp: runtime, operation, settings, githubTokenRejected: !!token && isGithubTokenRejected(token) };
 }
 
 const inProgress = () => new HostUpdateError("update_in_progress", "Another host update is in progress");
@@ -262,7 +274,14 @@ function releaseClaim(root: string, id: string): void {
   } catch { /* already released */ }
 }
 
-export async function startHostUpdate(target: HostUpdateTarget, version: string, compatibility: HostUpdateCompatibility): Promise<{ accepted: true; operation: HostUpdateOperation }> {
+export function saveHostUpdateSettings(settings: HostUpdateSettings): HostUpdateSettings {
+  const id = randomUUID();
+  const root = claimUpdate(id);
+  try { return writeHostUpdateSettings(settings); }
+  finally { releaseClaim(root, id); }
+}
+
+export async function startHostUpdate(target: HostUpdateTarget, version: string, compatibility: HostUpdateCompatibility, token?: string): Promise<{ accepted: true; operation: HostUpdateOperation }> {
   assertCompatibility(compatibility);
   if (target !== "ompweb" && target !== "omp") throw new HostUpdateError("invalid_target", "Invalid host software target", 400);
   if (typeof version !== "string" || version.length > 100 || !HOST_VERSION_PATTERN.test(version)) throw new HostUpdateError("invalid_version", "Invalid host update version", 400);
@@ -271,7 +290,7 @@ export async function startHostUpdate(target: HostUpdateTarget, version: string,
   const root = claimUpdate(id);
   let claimed = false;
   try {
-    const info = await checkHostUpdates(compatibility, true);
+    const info = await checkHostUpdates(compatibility, true, token);
     const software = info[target];
     if (!software.updateAvailable || software.availableVersion !== version) throw new HostUpdateError("candidate_changed", "The available update candidate changed; refresh host updates");
     if (!software.canUpdate) throw new HostUpdateError("update_blocked", software.blockedReason || "This host update is blocked");
@@ -285,10 +304,13 @@ export async function startHostUpdate(target: HostUpdateTarget, version: string,
     if (target === "omp") {
       void (async () => {
         try {
-          await runOmpUpdate([], 5 * 60 * 1000);
-          // `omp update` installs the newest release, which may have moved past the one requested: that is a success, an older one is not.
-          const reported = (await checkOmpUpdate(true)).currentVersion;
-          if (!reported || (reported.replace(/^v/, "") !== version && !isNewerVersion(reported, version))) throw new Error(`omp update did not install the requested version ${version} (reported ${reported || "unknown"})`);
+          if (info.settings?.ompSource === "custom") await runCustomOmpUpdate(info.settings.ompRepository, version, token);
+          else {
+            await runOmpUpdate([], 5 * 60 * 1000);
+            // Upstream may advance between check and install; a newer version is also success.
+            const reported = (await checkOmpUpdate(true)).currentVersion;
+            if (!reported || (reported.replace(/^v/, "") !== version && !isNewerVersion(reported, version))) throw new Error(`omp update did not install the requested version ${version} (reported ${reported || "unknown"})`);
+          }
           finishHostUpdate(id);
         } catch (error) { finishHostUpdate(id, messageOf(error)); }
       })().catch((error) => console.error("Could not persist host runtime update status:", error));
@@ -301,6 +323,11 @@ export async function startHostUpdate(target: HostUpdateTarget, version: string,
     mkdirSync(attempt, { mode: 0o700 });
     const binary = method === "binary";
     const descriptor: HostUpdateDescriptor = { id, target, version, fromVersion: packageJson.version, installMethod: method, installDir: installDirectory(), runtime: process.execPath, hostArgs: hostArguments(binary), cwd: process.cwd(), daemonPid: process.pid, daemonIdentity: plan!.daemonIdentity, restartOnly: plan!.restartOnly || undefined, systemd: plan!.systemd };
+    if (info.settings?.ompwebChannel === "prerelease") {
+      descriptor.channel = "prerelease";
+      descriptor.releaseTag = version;
+      descriptor.releaseSha = (await checkPrereleaseUpdate(true, token)).releaseSha;
+    }
     if (!binary && !descriptor.restartOnly) {
       const names = process.platform === "win32" ? method === "npm" ? ["npm.cmd", "npm.exe"] : ["bun.exe"] : [method];
       const manager = (process.env.PATH || "").split(delimiter).flatMap((directory) => names.map((name) => join(directory, name))).find((path) => existsSync(path));
@@ -321,8 +348,9 @@ export async function startHostUpdate(target: HostUpdateTarget, version: string,
     if (binary) args = ["host-update-worker", descriptorPath];
     else {
       const copiedWorker = join(attempt, "worker.mts");
-      copyFileSync(fileURLToPath(new URL("./update-worker.ts", import.meta.url)), copiedWorker);
-      chmodSync(copiedWorker, 0o600);
+      const source = readFileSync(fileURLToPath(new URL("./update-worker.ts", import.meta.url)), "utf8");
+      writeFileSync(copiedWorker, source.replace('"../github-fetch"', '"./github-fetch.mts"'), { mode: 0o600, flag: "wx" });
+      copyFileSync(fileURLToPath(new URL("../github-fetch.ts", import.meta.url)), join(attempt, "github-fetch.mts"));
       args = [copiedWorker, "--host-update-descriptor", descriptorPath];
     }
     if (plan!.systemd) {
@@ -331,7 +359,7 @@ export async function startHostUpdate(target: HostUpdateTarget, version: string,
       args = [...options, command, ...args];
       command = "systemd-run";
     }
-    const child = spawn(command, args, { detached: true, cwd: attempt, stdio: "ignore", windowsHide: true, env: createChildProcessEnvironment() });
+    const child = spawn(command, args, { detached: true, cwd: attempt, stdio: "ignore", windowsHide: true, env: { ...createChildProcessEnvironment(), ...(token ? { OMP_WEB_UPDATE_GITHUB_TOKEN: token } : {}) } });
     child.once("error", (error) => {
       try { finishHostUpdate(id, `Could not launch host update worker: ${error.message}`); }
       catch (stateError) { console.error("Could not persist host update worker launch failure:", stateError); }

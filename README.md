@@ -287,10 +287,11 @@ tar -xzf ompweb-linux-x64.tar.gz -C ~/.local/share   # unpacks ompweb-linux-x64/
   `curl` reaches it, allow your terminal (or `ompweb`) under System Settings →
   Privacy & Security → Local Network. A server reached over a VPN such as
   Tailscale, or a host started from an SSH session, is not affected.
-- **No tray, service installers or in-app update.** To update, stop `ompweb` and
-  `ompweb host`, replace the directory with the new release, and start both again;
-  **Settings → System** links the release page when a new version is out.
-  Your sessions and settings live in `~/.omp`, not in that directory.
+- **No tray or service installers.** Update the web server through **Settings →
+  System**, and its daemon separately through **Settings → Hosts**. Binary
+  updates verify the release digest before replacing the installation and retain
+  the previous release for rollback. Sessions and settings live in `~/.omp`,
+  not in the release directory.
 - **As systemd user services**, write the two units yourself (adjust the paths;
   add omp's directory to `PATH`, or set `OMP_WEB_OMP_BIN`):
 
@@ -522,6 +523,37 @@ the host's restart-only update. Unsupported service wrappers and detected restar
 scripts show a manual-update reason. Stop external restart loops before updating
 a foreground daemon.
 
+Each host has **Source → Upstream** (the default, using `omp update`) or
+**Custom** for OMP, with a required GitHub `owner/repo`. Custom releases use
+`vX.Y.Z-int.<sha7>` tags, upstream-style `omp-<os>-<arch>` assets and
+`SHA256SUMS.txt`. The host verifies the checksum and runs `omp --smoke-test`
+before atomically switching `current` in a `releases/<tag>/` layout, or
+replacing an ordinary executable. Existing OMP processes keep their loaded version.
+
+**ompweb channel → Stable** remains the default. **Pre-release** checks the
+newest published main-build release and offers it only when GitHub confirms
+that its commit is ahead of the running build. Pre-release installations use
+the binary distribution, not npm. This machine's channel also controls the
+web server's **System** update check. Older daemons expose only the defaults.
+
+**Settings → Interface & Behavior → GitHub token** saves an optional server-wide
+fine-grained PAT for public repositories (read-only, no extra permissions).
+The browser sees only its last four characters; the credential is stored with
+mode `0600` and forwarded privately to linked hosts for update operations.
+`GITHUB_TOKEN` and `GH_TOKEN` remain fallbacks. Authorization is sent only to
+`api.github.com`, never release CDNs; a rejected token retries unauthenticated.
+
+An optional web-server `OMP_WEB_SELF_UPDATE_CMD` replaces the built-in binary
+swap with an operator-owned deployment command, after download, digest
+verification and unpacking. It receives `OMP_WEB_UPDATE_SHA` (full commit)
+and `OMP_WEB_UPDATE_DIR` (the unpacked release), runs in the updater's separate
+systemd scope where applicable, and owns deployment health checks and rollback.
+For example: `/path/to/deploy "$OMP_WEB_UPDATE_SHA" "$OMP_WEB_UPDATE_DIR"`.
+Host-daemon updates never invoke this web-server hook.
+
+A crashed custom OMP updater can leave `.omp-custom-update.lock` beside the
+installation. Remove it only after verifying that no updater is still running.
+
 A daemon update is carried out by a separate updater process on the host. It
 stops the daemon, swaps in the new release and starts it again, and on a failure
 it restores the previous release. If that updater is itself killed after stopping
@@ -744,6 +776,7 @@ Stop it with `Stop-ScheduledTask ompweb-host`, then end the running host with
 | `OMP_WEB_TRUSTED_HEADER_SHA256` | SHA-256 hex digest of the secret a trusted reverse proxy sends in `X-Omp-Web-Auth` to skip the password for that request; see [Skipping the password on trusted networks](#skipping-the-password-on-trusted-networks) | _None (disabled)_ |
 | `OMP_WEB_NO_OPEN` | Set to `1` to prevent auto-opening browser | `0` |
 | `OMP_WEB_DISABLE_AUTOUPDATE` | Set to `1` to disable update checks and in-app updates; restart after changing | `0` |
+| `OMP_WEB_SELF_UPDATE_CMD` | Optional verified-release deployment hook; receives `OMP_WEB_UPDATE_SHA` and `OMP_WEB_UPDATE_DIR` | _unset_ |
 | `OMP_WEB_NAME` | Name shown in browser tabs and installed-app names. `url`, `host` or `domain` (any case) uses the hostname the browser connected to, without port; localhost and IP addresses keep `omp web`. Any other value is used as-is. Restart after changing | `omp web` |
 | `OMP_WEB_OMP_BIN` | Path to `omp` binary if not on `PATH` | _auto-detected_ |
 | `PI_CODING_AGENT_DIR` | Custom omp agent directory | `~/.omp/agent` |

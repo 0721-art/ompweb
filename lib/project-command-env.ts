@@ -33,6 +33,8 @@ export const OMP_WEB_SECRET_ENV_VARS: readonly string[] = [
   // needs it, and an agent running `env` would otherwise print it into its
   // transcript and off to the model provider, as with the password hash.
   "OMP_WEB_STT_KEY",
+  "OMP_WEB_UPDATE_GITHUB_TOKEN",
+  "OMP_WEB_BINARY_RESTART_ENV",
 ];
 
 function comparableName(name: string, platform: NodeJS.Platform): string {

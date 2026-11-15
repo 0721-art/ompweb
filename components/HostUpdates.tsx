@@ -7,6 +7,7 @@ import type { HostRow } from "@/lib/hosts/hub";
 import type { HostUpdateInfo, HostUpdateOperation, HostUpdateTarget } from "@/lib/hosts/update-types";
 import { useI18n } from "@/lib/i18n";
 import { hostName } from "./host-status";
+import { HostUpdatePreferences } from "./HostUpdatePreferences";
 
 const buttonStyle = { padding: "6px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "transparent", color: "var(--text)", fontSize: 12, display: "inline-flex", alignItems: "center", gap: 5 } as const;
 const POLL_MS = 1000;
@@ -34,11 +35,24 @@ export function HostUpdates({ host }: { host: HostRow }) {
 
   useEffect(() => {
     mounted.current = true;
+    setInfo(null);
+    setPosting(false);
+    setMonitoring(false);
+    setNeedsStatus(false);
+    setUnsupported(false);
+    setError(null);
+    setConfirm(null);
+    setCheck(0);
+    setOperationCheck(0);
     return () => {
       mounted.current = false;
       postController.current?.abort();
+      postController.current = null;
+      inFlight.current = false;
+      watching.current = false;
+      deadline.current = 0;
     };
-  }, []);
+  }, [endpoint]);
 
   useEffect(() => {
     if (unavailable && !watching.current) {
@@ -116,7 +130,7 @@ export function HostUpdates({ host }: { host: HostRow }) {
   const update = async () => {
     const target = confirm;
     const software = target && info?.[target];
-    if (!target || !software?.canUpdate || !software.updateAvailable || !software.availableVersion || inFlight.current || watching.current || needsStatus || unavailable || unsupported || loading) return;
+    if (!target || !software?.canUpdate || !software.updateAvailable || !software.availableVersion || inFlight.current || posting || watching.current || needsStatus || unavailable || unsupported || loading) return;
     inFlight.current = true;
     setPosting(true);
     setConfirm(null);
@@ -130,7 +144,7 @@ export function HostUpdates({ host }: { host: HostRow }) {
         body: JSON.stringify({ target, version: software.availableVersion }),
       });
       const data = await response.json();
-      if (!mounted.current) return;
+      if (!mounted.current || postController.current !== controller) return;
       if (!response.ok) {
         if (response.status === 501) setUnsupported(true);
         // A lost or late answer (host offline, timed out, unreadable) may follow an update that started: reconcile.
@@ -146,7 +160,7 @@ export function HostUpdates({ host }: { host: HostRow }) {
       setMonitoring(true);
       setOperationCheck((value) => value + 1);
     } catch {
-      if (!mounted.current) return;
+      if (!mounted.current || postController.current !== controller) return;
       // The request may have reached the host: reconcile with GET, never resend it.
       setNeedsStatus(true);
       setError(t("hostUpdates.answerLost"));
@@ -156,9 +170,11 @@ export function HostUpdates({ host }: { host: HostRow }) {
       setOperationCheck((value) => value + 1);
     } finally {
       clearTimeout(timer);
-      inFlight.current = false;
-      postController.current = null;
-      if (mounted.current) setPosting(false);
+      if (postController.current === controller) {
+        inFlight.current = false;
+        postController.current = null;
+        if (mounted.current) setPosting(false);
+      }
     }
   };
 
@@ -174,6 +190,15 @@ export function HostUpdates({ host }: { host: HostRow }) {
           <RefreshCw size={13} aria-hidden="true" />{t(loading ? "hostUpdates.checking" : error || needsStatus ? "hostUpdates.retry" : "hostUpdates.check")}
         </button>
       </div>
+      {info?.settings && <HostUpdatePreferences key={host.id} endpoint={endpoint} settings={info.settings} disabled={disabled || needsStatus} onPendingChange={setPosting} onSaved={(settings) => {
+        setConfirm(null);
+        setInfo((previous) => previous && {
+          ...previous, settings,
+          ompweb: { ...previous.ompweb, availableVersion: null, updateAvailable: false, canUpdate: false, blockedReason: null },
+          omp: { ...previous.omp, availableVersion: null, updateAvailable: false, canUpdate: false, blockedReason: null },
+        });
+        setCheck((value) => value + 1);
+      }} />}
       {(["ompweb", "omp"] as const).map((target) => {
         const software = info?.[target];
         const label = t(`hostUpdates.${target}`);

@@ -1,4 +1,4 @@
-// This file is copied outside the install before an update. Keep it self-contained and Node 24 compatible.
+// Copied outside the install with github-fetch.ts before an update. Keep it Node 24 compatible.
 import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -9,11 +9,19 @@ import { promisify } from "node:util";
 import type { HostUpdateOperation, HostUpdateTarget } from "./update-types";
 
 import { setTimeout as pause } from "node:timers/promises";
+import { githubFetch } from "../github-fetch";
 const exec = promisify(execFile);
 const MAX_ARCHIVE = 200 * 1024 * 1024;
 const MAX_EXPANDED = 512 * 1024 * 1024;
 const MAX_MEMBER = 256 * 1024 * 1024;
-export const HOST_VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/;
+export const HOST_VERSION_PATTERN = /^(?:(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?|\d{8}T\d{6}Z-[a-f0-9]{10})$/;
+const PRERELEASE_VERSION = /^\d{8}T\d{6}Z-([a-f0-9]{10})$/;
+function validPrereleaseStamp(version: string): boolean {
+  const stamp = version.slice(0, 16);
+  const iso = `${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 8)}T${stamp.slice(9, 11)}:${stamp.slice(11, 13)}:${stamp.slice(13, 15)}.000Z`;
+  const time = Date.parse(iso);
+  return Number.isFinite(time) && new Date(time).toISOString() === iso;
+}
 
 export interface HostUpdateStoredState {
   operation: HostUpdateOperation;
@@ -36,6 +44,11 @@ export interface HostUpdateDescriptor {
   daemonIdentity?: string | null;
   managerPath?: string;
   restartOnly?: boolean;
+  channel?: "stable" | "prerelease";
+  releaseTag?: string;
+  releaseSha?: string;
+  /** Private attempt data only; never copied into operation/status responses. */
+  token?: string;
   systemd: { unit: string; user: boolean } | null;
 }
 
@@ -118,11 +131,12 @@ export function finishHostUpdate(id: string, error?: string): void {
   }
 }
 
-export async function fetchHostUpdateBytes(url: string, maxBytes: number, timeout = 5000): Promise<Buffer> {
+export async function fetchHostUpdateBytes(url: string, maxBytes: number, timeout = 5000, token?: string): Promise<Buffer> {
+  token ??= process.env.OMP_WEB_UPDATE_GITHUB_TOKEN;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    const response = await fetch(url, { signal: controller.signal, cache: "no-store", headers: { "User-Agent": "ompweb-host-updater" } });
+    const response = await githubFetch(url, { signal: controller.signal, cache: "no-store", headers: { "User-Agent": "ompweb-host-updater" } }, token);
     if (!response.ok || !response.body) throw new Error(`Release request failed (${response.status})`);
     if (response.url && (!response.url.startsWith("https://") || !["raw.githubusercontent.com", "api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"].includes(new URL(response.url).hostname))) throw new Error("Unexpected release download destination");
     if (Number(response.headers.get("content-length")) > maxBytes) throw new Error("Release response is too large");
@@ -217,13 +231,16 @@ export function validateHostReleaseArchive(input: Uint8Array, root: string): Arc
   return entries;
 }
 
-async function stageBinary(d: HostUpdateDescriptor, staging: string): Promise<string> {
+export async function stageBinary(d: Pick<HostUpdateDescriptor, "version" | "channel" | "releaseTag" | "releaseSha" | "token">, staging: string): Promise<string> {
   const name = hostReleaseName();
   const assetName = `${name}${process.platform === "win32" ? ".zip" : ".tar.gz"}`;
-  const metadata = JSON.parse((await fetchHostUpdateBytes(`https://api.github.com/repos/kahme247/ompweb/releases/tags/v${d.version}`, 2 * 1024 * 1024)).toString("utf8")) as { tag_name?: string; assets?: { name: string; digest?: string }[] };
+  const prerelease = PRERELEASE_VERSION.exec(d.version);
+  const tag = d.releaseTag ?? (prerelease ? d.version : `v${d.version}`);
+  if (!HOST_VERSION_PATTERN.test(d.version) || tag !== (prerelease ? d.version : `v${d.version}`) || (prerelease && (!validPrereleaseStamp(d.version) || d.channel !== "prerelease" || !/^[a-f0-9]{40}$/.test(d.releaseSha ?? "") || !d.releaseSha!.startsWith(prerelease[1])))) throw new Error("Invalid binary release tag or commit");
+  const metadata = JSON.parse((await fetchHostUpdateBytes(`https://api.github.com/repos/kahme247/ompweb/releases/tags/${encodeURIComponent(tag)}`, 2 * 1024 * 1024, 5000, d.token)).toString("utf8")) as { tag_name?: string; assets?: { name: string; digest?: string }[] };
   const asset = metadata.assets?.find((item) => item.name === assetName);
-  if (metadata.tag_name !== `v${d.version}` || !asset?.digest || !/^sha256:[a-f0-9]{64}$/.test(asset.digest)) throw new Error("Official release asset digest is unavailable");
-  const compressed = await fetchHostUpdateBytes(`https://github.com/kahme247/ompweb/releases/download/v${d.version}/${assetName}`, MAX_ARCHIVE, 120000);
+  if (metadata.tag_name !== tag || !asset?.digest || !/^sha256:[a-f0-9]{64}$/.test(asset.digest)) throw new Error("Official release asset digest is unavailable");
+  const compressed = await fetchHostUpdateBytes(`https://github.com/kahme247/ompweb/releases/download/${encodeURIComponent(tag)}/${assetName}`, MAX_ARCHIVE, 120000, d.token);
   verifyHostReleaseDigest(compressed, asset.digest);
   const archive = process.platform === "win32" ? compressed : gunzipSync(compressed, { maxOutputLength: MAX_EXPANDED });
   const members = validateHostReleaseArchive(archive, name);
@@ -240,6 +257,7 @@ async function stageBinary(d: HostUpdateDescriptor, staging: string): Promise<st
   const binary = join(release, process.platform === "win32" ? "ompweb.exe" : "ompweb");
   chmodSync(binary, 0o755);
   if (!existsSync(join(release, "dist", "index.html")) || !existsSync(join(release, "lib", "omp", "session-edit-extension.mjs"))) throw new Error("Incomplete host binary release layout");
+  if (prerelease && d.releaseSha && !(await binaryContainsCommit(binary, release, d.releaseSha))) throw new Error("Downloaded binary reports a different commit");
   if (!(await binaryReportsVersion(binary, release, d.version))) throw new Error("Downloaded host binary reports a different version");
   return release;
 }
@@ -266,7 +284,7 @@ async function stagePackage(d: HostUpdateDescriptor, staging: string): Promise<s
 }
 function workerEnvironment(additions: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env = { ...process.env, ...additions };
-  for (const name of Object.keys(env)) if (["PORT", "NODE_ENV", "OMP_WEB_PASSWORD", "OMP_WEB_PASSWORD_HASH", "OMP_WEB_TRUSTED_HEADER_SECRET", "OMP_WEB_TRUSTED_HEADER_SHA256", "OMP_WEB_PACKAGE_DIR", "OMP_WEB_LAUNCHER_PID"].includes(name.toUpperCase()) && !(name in additions)) delete env[name];
+  for (const name of Object.keys(env)) if (["PORT", "NODE_ENV", "OMP_WEB_PASSWORD", "OMP_WEB_PASSWORD_HASH", "OMP_WEB_TRUSTED_HEADER_SECRET", "OMP_WEB_TRUSTED_HEADER_SHA256", "OMP_WEB_PACKAGE_DIR", "OMP_WEB_LAUNCHER_PID", "OMP_WEB_UPDATE_GITHUB_TOKEN"].includes(name.toUpperCase()) && !(name in additions)) delete env[name];
   return env;
 }
 
@@ -328,8 +346,31 @@ export async function verifyHostServiceInstall(service: NonNullable<HostUpdateDe
   if (!valid) throw new Error("Host service restart targets a different installation or unsupported wrapper; update it manually");
 }
 
-/** `<binary> --version` printed the exact version (a leading v is allowed). */
+/** New binaries print their commit; existing prereleases embed it in the version label's client bundle. */
+async function binaryContainsCommit(binary: string, packageDir: string, sha: string): Promise<boolean> {
+  const { stdout } = await exec(binary, ["--version"], { timeout: 10000, env: workerEnvironment({ OMP_WEB_PACKAGE_DIR: packageDir }), maxBuffer: 1024 * 1024 });
+  if (stdout.match(/[a-f0-9]{40}/g)?.includes(sha)) return true;
+  try {
+    const assets = join(packageDir, "dist", "assets");
+    return readdirSync(assets).some((file) => file.endsWith(".js") && new RegExp(`["']${sha}["']`).test(readFileSync(join(assets, file), "utf8")));
+  } catch { return false; }
+}
+/** A release tag may identify a commit while its package version remains semver. */
 async function binaryReportsVersion(binary: string, packageDir: string, version: string): Promise<boolean> {
+  const prerelease = PRERELEASE_VERSION.exec(version);
+  if (prerelease) {
+    if (!validPrereleaseStamp(version)) return false;
+    try {
+      const build = JSON.parse(readFileSync(join(packageDir, "ompweb-build.json"), "utf8"));
+      if (typeof build.sha === "string" && /^[a-f0-9]{40}$/.test(build.sha) && build.sha.startsWith(prerelease[1])) return await binaryContainsCommit(binary, packageDir, build.sha);
+    } catch {}
+    const { stdout } = await exec(binary, ["--version"], { timeout: 10000, env: workerEnvironment({ OMP_WEB_PACKAGE_DIR: packageDir }), maxBuffer: 1024 * 1024 });
+    if (stdout.match(/[a-f0-9]{40}/g)?.some((sha) => sha.startsWith(prerelease[1]))) return true;
+    try {
+      const assets = join(packageDir, "dist", "assets");
+      return readdirSync(assets).some((file) => file.endsWith(".js") && new RegExp(`["']${prerelease[1]}[a-f0-9]{30}["']`).test(readFileSync(join(assets, file), "utf8")));
+    } catch { return false; }
+  }
   const { stdout } = await exec(binary, ["--version"], { timeout: 10000, env: workerEnvironment({ OMP_WEB_PACKAGE_DIR: packageDir }), maxBuffer: 1024 * 1024 });
   return stdout.trim().split(/\s+/).some((token) => token.replace(/^v/, "") === version);
 }
@@ -479,6 +520,8 @@ function validateDescriptor(path: string): HostUpdateDescriptor {
   const d = JSON.parse(readFileSync(path, "utf8")) as HostUpdateDescriptor;
   if (!/^[a-zA-Z0-9-]{1,80}$/.test(d.id) || resolve(path) !== join(root, d.id, "descriptor.json") || !HOST_VERSION_PATTERN.test(d.version) || !HOST_VERSION_PATTERN.test(d.fromVersion) || d.target !== "ompweb" || !["npm", "bun", "binary"].includes(d.installMethod) || !isAbsolute(d.installDir) || !isAbsolute(d.runtime) || !isAbsolute(d.cwd) || !Number.isSafeInteger(d.daemonPid) || d.daemonPid <= 1 || !Array.isArray(d.hostArgs) || d.hostArgs.some((arg) => arg !== "--allow-http")) throw new Error("Invalid host update descriptor");
   if (d.restartOnly !== undefined && typeof d.restartOnly !== "boolean") throw new Error("Invalid host restart-only descriptor");
+  if ((d.channel !== undefined && !["stable", "prerelease"].includes(d.channel)) || (d.token !== undefined && (typeof d.token !== "string" || d.token.length > 4096 || /[\r\n]/.test(d.token)))) throw new Error("Invalid host release descriptor");
+  if (PRERELEASE_VERSION.test(d.version) && (!validPrereleaseStamp(d.version) || d.channel !== "prerelease" || d.installMethod !== "binary" || d.releaseTag !== d.version || !/^[a-f0-9]{40}$/.test(d.releaseSha ?? "") || !d.releaseSha!.startsWith(PRERELEASE_VERSION.exec(d.version)![1]))) throw new Error("Invalid host pre-release descriptor");
   if (!d.systemd && (typeof d.daemonIdentity !== "string" || !d.daemonIdentity || d.daemonIdentity.length > 200)) throw new Error("Invalid host update descriptor: the daemon's process identity is missing");
   assertOwnedPath(dirname(path), true);
   const state = readHostUpdateState();

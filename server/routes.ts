@@ -21,6 +21,7 @@ import * as filesPath from "@/app/api/files/[...path]/route";
 import * as gitDiff from "@/app/api/git/diff/route";
 import * as gitStatus from "@/app/api/git/status/route";
 import * as githubRepo from "@/app/api/github-repo/route";
+import * as githubToken from "@/app/api/github-token/route";
 import * as home from "@/app/api/home/route";
 import * as hostsLink from "@/app/api/hosts/link/route";
 import * as hosts from "@/app/api/hosts/route";
@@ -117,6 +118,7 @@ export const ROUTE_MODULES: Record<string, RouteModule> = {
   "git/diff": gitDiff,
   "git/status": gitStatus,
   "github-repo": githubRepo,
+  "github-token": githubToken,
   "home": home,
   "hosts/link": hostsLink,
   "hosts": hosts,

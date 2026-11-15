@@ -1,3 +1,6 @@
+import { getGithubToken } from "../github-token";
+import { rejectGithubToken } from "../github-fetch";
+import { isHostUpdateSettings, type HostUpdateSettings } from "./update-settings";
 // Main-server end of the host link (spec "Link protocol"): accepts `ompweb
 // host` daemons on /api/hosts/link and exposes each linked machine as a
 // `RemoteHost`. Everything a daemon sends is untrusted input.
@@ -1583,14 +1586,18 @@ function updateOperation(value: unknown): value is HostUpdateOperation {
 /** Every machine, including this one, checks on its daemon. Never fall back to the web server's installation. */
 export async function getHostSoftwareUpdates(id: string, force = false): Promise<HostUpdateInfo> {
   requireUpdateHost(id);
-  const result = await request(id, "checkUpdates", { compatibility: updateCompatibility(), force });
+  const githubToken = getGithubToken();
+  const result = await request(id, "checkUpdates", { compatibility: updateCompatibility(), force, ...(githubToken ? { githubToken } : {}) });
   if (!isRecord(result) || !softwareUpdate(result.ompweb) || !softwareUpdate(result.omp)
     || !["npm", "bun", "binary"].includes(String(result.ompweb.installMethod))
     || !(result.ompweb.protocolVersion === null || (Number.isSafeInteger(result.ompweb.protocolVersion) && Number(result.ompweb.protocolVersion) > 0))
-    || !(result.operation === null || updateOperation(result.operation))) {
+    || !(result.operation === null || updateOperation(result.operation))
+    || (result.settings !== undefined && !isHostUpdateSettings(result.settings))
+    || (result.githubTokenRejected !== undefined && typeof result.githubTokenRejected !== "boolean")) {
     throw new HostOpError(502, "host_bad_result", "The host returned an invalid update status");
   }
   const info = result as unknown as HostUpdateInfo;
+  if (info.githubTokenRejected && githubToken) rejectGithubToken(githubToken);
   const protocol = info.ompweb.protocolVersion;
   if (info.ompweb.updateAvailable && (protocol === null || protocol < MIN_LINK_PROTOCOL_VERSION || protocol > LINK_PROTOCOL_VERSION)) {
     return { ...info, ompweb: { ...info.ompweb, canUpdate: false, blockedReason: protocol === null
@@ -1606,12 +1613,28 @@ export async function updateHostSoftware(id: string, target: HostUpdateTarget, v
   if (!candidate.updateAvailable || !candidate.canUpdate || candidate.availableVersion !== version) {
     throw new HostOpError(409, "host_update_blocked", candidate.blockedReason ?? "The available version changed; check for updates again");
   }
-  const result = await request(id, "updateSoftware", { target, version, compatibility: updateCompatibility() });
+  const githubToken = getGithubToken();
+  const result = await request(id, "updateSoftware", { target, version, compatibility: updateCompatibility(), ...(githubToken ? { githubToken } : {}) });
   if (!isRecord(result) || result.accepted !== true || !updateOperation(result.operation)
     || result.operation.target !== target || result.operation.version !== version) {
     throw new HostOpError(502, "host_bad_result", "The host returned an invalid update operation");
   }
   return { accepted: true, operation: result.operation };
+}
+
+export async function setHostUpdateSettings(id: string, settings: HostUpdateSettings): Promise<HostUpdateSettings> {
+  requireUpdateHost(id);
+  if (!isHostUpdateSettings(settings)) throw new HostOpError(400, "invalid_request", "Invalid host update settings");
+  const result = await request(id, "setUpdateSettings", { settings });
+  if (!isHostUpdateSettings(result)) throw new HostOpError(502, "host_bad_result", "Invalid host update settings response");
+  return result;
+}
+
+export async function getHostUpdateSettings(id: string): Promise<HostUpdateSettings> {
+  if (!getHost(id)) throw new HostOpError(404, "host_not_found", "Unknown host");
+  const result = await request(id, "getUpdateSettings", {});
+  if (!isHostUpdateSettings(result)) throw new HostOpError(502, "host_bad_result", "Invalid host update settings response");
+  return result;
 }
 
 export interface LinkedHostRow {

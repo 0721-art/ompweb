@@ -6,6 +6,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   rmdirSync,
@@ -13,7 +14,7 @@ import {
   type Stats,
 } from "fs";
 import { execFile, spawn } from "child_process";
-import { createChildProcessEnvironment } from "./project-command-env";
+import { createChildProcessEnvironment, isHostRuntimeVariable, isOmpWebSecretVariable } from "./project-command-env";
 import { randomUUID } from "crypto";
 import { tmpdir } from "os";
 import { dirname, join, posix, resolve, win32 } from "path";
@@ -21,6 +22,9 @@ import { promisify } from "util";
 import { checkNpmUpdate, detectInstallMethod } from "./npm-update";
 import { checkOmpUpdate } from "./omp/updates";
 import { DISABLE_AUTOUPDATE_ENV_VAR, isUpdateDisabled } from "./update-policy";
+import { checkPrereleaseUpdate, resolveOmpwebReleaseSha } from "./ompweb-releases";
+import { processStartIdentity, stageBinary } from "./hosts/update-worker";
+import { parseLaunchOptions } from "../bin/omp-web-options";
 
 const LEASE_MS = 30 * 60 * 1000;
 const TERMINAL_STATUS_TTL_MS = 24 * 60 * 60 * 1000;
@@ -44,6 +48,8 @@ export interface SelfUpdateStatus {
 interface StoredStatus extends SelfUpdateStatus {
   workerPid?: number;
   managerPid?: number;
+  deploy?: boolean;
+  binaryWorker?: boolean;
 }
 export interface PrepareResult {
   attemptId: string;
@@ -57,6 +63,10 @@ export class SelfUpdateError extends Error {
 }
 
 type Kind = "app" | "omp";
+export interface SelfUpdateOptions {
+  channel?: "stable" | "prerelease";
+  token?: string;
+}
 
 function assertUpdatesEnabled(): void {
   if (!isUpdateDisabled()) return;
@@ -72,6 +82,8 @@ export function resolveSelfUpdateTempRoot(
   const pathApi = platform === "win32" ? win32 : posix;
   const suffix = platform === "win32" ? "" : `-${uid ?? "user"}`;
   const base = kind === "omp" ? "omp-self-update" : "ompweb-self-update";
+  // Canonicalize only the temp ancestor; the update root itself must still reject symlinks.
+  if (platform === process.platform && existsSync(temporary)) temporary = realpathSync(temporary);
   return pathApi.join(temporary, `${base}${suffix}`);
 }
 
@@ -214,6 +226,23 @@ function removeSecureEmptyDirectory(path: string): boolean {
     throw error;
   }
 }
+function validateOwnedTree(path: string): void {
+  const info = lstatSync(path);
+  if (info.isDirectory() && !info.isSymbolicLink()) {
+    secureDirectory(path);
+    for (const name of readdirSync(path)) validateOwnedTree(join(path, name));
+  } else {
+    secureRegularFile(path);
+  }
+}
+function removeOwnedTree(path: string): boolean {
+  const info = lstatSync(path);
+  if (!info.isDirectory()) return removeSecureFile(path);
+  for (const name of readdirSync(path)) {
+    if (!removeOwnedTree(join(path, name))) return false;
+  }
+  return removeSecureEmptyDirectory(path);
+}
 function removeAttemptDirectory(attemptId: string, kind: Kind): boolean {
   const attempts = attemptsDir(kind, false);
   if (!attempts) return true;
@@ -225,10 +254,14 @@ function removeAttemptDirectory(attemptId: string, kind: Kind): boolean {
     throw error;
   }
   const entries = readdirSync(dir);
-  if (entries.some((e) => e !== "worker.js")) {
+  if (entries.some((e) => !["worker.js", "worker", "worker.exe", "deploy.json", "staging"].includes(e))) {
     throw new SelfUpdateError("unsafe_update_state", "The temporary update attempt contains unexpected files", 500);
   }
-  if (entries.includes("worker.js") && !removeSecureFile(join(dir, "worker.js"))) return false;
+  // Preflight the entire tree before deleting anything; never follow staged links.
+  validateOwnedTree(dir);
+  for (const name of entries) {
+    if (!removeOwnedTree(join(dir, name))) return false;
+  }
   return removeSecureEmptyDirectory(dir);
 }
 function removeAttemptArtifacts(attemptId: string, kind: Kind, includeCompletionAck = true): boolean {
@@ -344,12 +377,12 @@ async function detectSystemdService(launcherPid: number): Promise<SystemdService
   }
   return Number(stdout.trim()) === launcherPid ? service : null;
 }
-export function getSelfUpdateSupport(): { supported: boolean; reason?: string; packageDir: string } {
+export function getSelfUpdateSupport(kind: Kind = "app"): { supported: boolean; reason?: string; packageDir: string } {
   const packageDir = process.env.OMP_WEB_PACKAGE_DIR ?? process.cwd();
+  if (kind === "omp" && Bun.isStandaloneExecutable) return { supported: false, reason: "The legacy runtime updater requires a package installation", packageDir };
   if (isUpdateDisabled()) {
     return { supported: false, reason: `Updates are disabled by ${DISABLE_AUTOUPDATE_ENV_VAR}`, packageDir };
   }
-  if (Bun.isStandaloneExecutable) return { supported: false, reason: "The ompweb binary updates by download", packageDir };
   // simplified: always supported if packageDir exists
   try {
     if (!existsSync(packageDir)) return { supported: false, reason: "package dir not found", packageDir };
@@ -365,12 +398,12 @@ function detectManager(packageDir: string): { manager: "npm" | "bun"; managerPat
   return { manager, managerPath, prefix: [] };
 }
 
-export async function prepareSelfUpdate(kind: Kind = "app"): Promise<PrepareResult> {
+export async function prepareSelfUpdate(kind: Kind = "app", options: SelfUpdateOptions = {}): Promise<PrepareResult> {
   assertUpdatesEnabled();
-  // The compiled binary has no npm install to replace and no runtime for the worker: its updates run from a terminal.
-  if (Bun.isStandaloneExecutable) {
-    throw new SelfUpdateError("self_update_unsupported", "In-app updates are not available in the ompweb binary: update from a terminal", 409);
-  }
+  if (kind === "omp" && Bun.isStandaloneExecutable) throw new SelfUpdateError("self_update_unsupported", "The legacy runtime updater requires a package installation", 409);
+  const deploy = kind === "app" && Boolean(process.env.OMP_WEB_SELF_UPDATE_CMD);
+  const binary = kind === "app" && (Bun.isStandaloneExecutable || deploy);
+  if (kind === "app" && options.channel === "prerelease" && !deploy && !Bun.isStandaloneExecutable) throw new SelfUpdateError("self_update_unsupported", "Pre-release binary updates require OMP_WEB_SELF_UPDATE_CMD for package installations", 409);
   cleanupStaleSelfUpdate(Date.now(), kind);
   ensureSecureRoot(kind, true);
   const leaseFile = leasePath(kind);
@@ -381,6 +414,8 @@ export async function prepareSelfUpdate(kind: Kind = "app"): Promise<PrepareResu
   }
   let currentVersion: string;
   let targetVersion: string;
+  let releaseSha: string | undefined;
+  let releaseTag: string | undefined;
   if (kind === "omp") {
     const ompStatus = await checkOmpUpdate(true);
     if (!ompStatus.updateAvailable || !ompStatus.availableVersion) {
@@ -389,12 +424,16 @@ export async function prepareSelfUpdate(kind: Kind = "app"): Promise<PrepareResu
     currentVersion = ompStatus.currentVersion ?? "unknown";
     targetVersion = ompStatus.availableVersion;
   } else {
-    const npmStatus = await checkNpmUpdate(true);
+    const npmStatus = options.channel === "prerelease" ? await checkPrereleaseUpdate(true, options.token) : await checkNpmUpdate(true);
     if (!npmStatus.updateAvailable || !npmStatus.availableVersion) {
       throw new SelfUpdateError("no_update_available", "No update available", 409);
     }
     currentVersion = npmStatus.currentVersion;
     targetVersion = npmStatus.availableVersion;
+    if (binary) {
+      releaseTag = options.channel === "prerelease" ? targetVersion : `v${targetVersion}`;
+      releaseSha = await resolveOmpwebReleaseSha(releaseTag, options.token);
+    }
   }
   const attemptId = randomUUID();
   const preparedAt = new Date().toISOString();
@@ -407,6 +446,8 @@ export async function prepareSelfUpdate(kind: Kind = "app"): Promise<PrepareResu
     fromVersion: currentVersion,
     targetVersion,
     preparedAt,
+    deploy: deploy || undefined,
+    binaryWorker: Bun.isStandaloneExecutable || undefined,
   };
   atomicWrite(statusFile, JSON.stringify(stored));
   // copy worker
@@ -414,13 +455,29 @@ export async function prepareSelfUpdate(kind: Kind = "app"): Promise<PrepareResu
   const attemptDir = join(attempts, attemptId);
   mkdirSync(attemptDir, { mode: 0o700, recursive: true });
   secureDirectory(attemptDir);
-  const workerSrc = join(process.env.OMP_WEB_PACKAGE_DIR ?? process.cwd(), "bin", "omp-web-update-worker.js");
-  const destWorker = join(attemptDir, "worker.js");
-  if (existsSync(workerSrc)) {
+  const packageDir = process.env.OMP_WEB_PACKAGE_DIR ?? process.cwd();
+  const workerSrc = stored.binaryWorker ? process.execPath : join(packageDir, "bin", "omp-web-update-worker.js");
+  const destWorker = join(attemptDir, stored.binaryWorker ? (process.platform === "win32" ? "worker.exe" : "worker") : "worker.js");
+  try {
+    if (binary) {
+      const staging = join(attemptDir, "staging");
+      mkdirSync(staging, { mode: 0o700 });
+      const directory = await stageBinary({ version: targetVersion, channel: options.channel ?? "stable", releaseTag, releaseSha, token: options.token }, staging);
+      const restart = stored.binaryWorker && !deploy ? {
+        binaryPath: realpathSync(process.execPath),
+        binaryArgs: process.argv.slice(2),
+        cwd: process.cwd(),
+        pid: process.pid,
+        identity: await processStartIdentity(process.pid),
+      } : undefined;
+      atomicWrite(join(attemptDir, "deploy.json"), JSON.stringify({ attemptId, sha: releaseSha, directory, restart }));
+    }
     copyFileSync(workerSrc, destWorker);
-    try {
-      chmodSync(destWorker, 0o600);
-    } catch {}
+    chmodSync(destWorker, stored.binaryWorker ? 0o700 : 0o600);
+  } catch (error) {
+    atomicWrite(statusFile, JSON.stringify({ ...stored, state: "failed", error: error instanceof Error ? error.message : String(error), finishedAt: new Date().toISOString(), cleanupReady: true }));
+    removeSecureFile(leaseFile);
+    throw error;
   }
   // write ready marker
   atomicWrite(markerPath(attemptId, "ready", kind), JSON.stringify({ attemptId, preparedAt }));
@@ -472,17 +529,20 @@ export async function commitSelfUpdate(attemptId: string, kind: Kind = "app"): P
   }
   // spawn worker detached
   const attempts = attemptsDir(kind, false);
-  const workerPath = attempts ? join(attempts, attemptId, "worker.js") : null;
+  const workerPath = attempts ? join(attempts, attemptId, status.binaryWorker ? (process.platform === "win32" ? "worker.exe" : "worker") : "worker.js") : null;
   const root = rootDir(kind);
   const packageDir = process.env.OMP_WEB_PACKAGE_DIR ?? process.cwd();
-  const { manager, managerPath, prefix } = detectManager(packageDir);
+  const { manager, managerPath, prefix } = status.binaryWorker || status.deploy
+    ? { manager: "npm", managerPath: "", prefix: [] }
+    : detectManager(packageDir);
   const fromVersion = status.fromVersion;
   const targetVersion = status.targetVersion;
-  const launcherPid = Number(process.env.OMP_WEB_LAUNCHER_PID ?? process.pid);
+  const launcherPid = status.binaryWorker ? process.pid : Number(process.env.OMP_WEB_LAUNCHER_PID ?? process.pid);
+  const listen = status.binaryWorker ? parseLaunchOptions() : null;
   const descriptor = {
-    launcherPath: join(resolve(packageDir), "bin", "omp-web.js"),
-    hostname: process.env.OMP_WEB_HOSTNAME ?? process.env.HOSTNAME ?? "127.0.0.1",
-    port: Number(process.env.OMP_WEB_PORT ?? process.env.PORT ?? 30178),
+    ...(!status.binaryWorker ? { launcherPath: join(resolve(packageDir), "bin", "omp-web.js") } : {}),
+    hostname: listen?.hostname ?? process.env.OMP_WEB_HOSTNAME ?? process.env.HOSTNAME ?? "127.0.0.1",
+    port: Number(listen?.port ?? process.env.OMP_WEB_PORT ?? process.env.PORT ?? 30178),
   };
   const args = [
     workerPath ?? "",
@@ -504,18 +564,22 @@ export async function commitSelfUpdate(attemptId: string, kind: Kind = "app"): P
     String(launcherPid),
     "--server-pid",
     String(process.pid),
+    "--descriptor",
     JSON.stringify(descriptor),
     "--manager-prefix",
     JSON.stringify(prefix),
     "--kind",
     kind,
   ];
+  if ((status.deploy || status.binaryWorker) && kind === "app" && attempts) {
+    args.push(status.deploy ? "--deploy-descriptor" : "--binary-descriptor", join(attempts, attemptId, "deploy.json"));
+  }
   try {
     const systemd = kind === "app" ? await detectSystemdService(launcherPid) : null;
     if (systemd) args.push("--systemd-unit", systemd.unit, "--systemd-user", systemd.user ? "1" : "0");
-    const workerArgs = workerPath ? [workerPath, ...args] : args;
+    const workerArgs = status.binaryWorker ? ["self-update-worker", ...args.slice(1)] : args;
     // Windows locks a running bun.exe, and npm replaces the package's: the worker runs on the launcher's Node.
-    const runtime = process.env.OMP_WEB_NODE_BIN || process.execPath;
+    const runtime = status.binaryWorker ? workerPath! : process.env.OMP_WEB_NODE_BIN || process.execPath;
     let command = runtime;
     let commandArgs = workerArgs;
     if (systemd) {
@@ -536,9 +600,11 @@ export async function commitSelfUpdate(attemptId: string, kind: Kind = "app"): P
       detached: true,
       stdio: "ignore",
       windowsHide: true,
-      // The worker and everything it runs inherit this environment, so the web
-      // password hash must not be in it (issue #239).
-      env: createChildProcessEnvironment(),
+      // Only a binary's own restart receives its authentication environment; never persist it in the attempt.
+      env: {
+        ...createChildProcessEnvironment(),
+        ...(status.binaryWorker && !status.deploy ? { OMP_WEB_BINARY_RESTART_ENV: JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([name]) => isHostRuntimeVariable(name) || isOmpWebSecretVariable(name)))) } : {}),
+      },
     });
     // A failed launch arrives as an event, after this function returned.
     child.once("error", (error) => {
@@ -588,7 +654,9 @@ export function acknowledgeSelfUpdate(attemptId: string, kind: Kind = "app"): { 
     throw new SelfUpdateError("cleanup_not_ready", "The update is still finishing cleanup", 409);
   }
   // remove artifacts
-  removeAttemptArtifacts(attemptId, kind);
+  if (!removeAttemptArtifacts(attemptId, kind)) {
+    throw new SelfUpdateError("cleanup_not_ready", "The update is still finishing cleanup", 409);
+  }
   // release lease
   if (lease && (lease as { attemptId?: string }).attemptId === attemptId) {
     removeSecureFile(leasePath(kind));

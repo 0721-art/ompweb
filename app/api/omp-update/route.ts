@@ -34,8 +34,8 @@ export async function POST(request: Request) {
     if (!body || typeof body !== "object" || Array.isArray(body)) throw new SelfUpdateError("invalid_action", "action must be check, restart, update, status, or acknowledge");
     const keys = Object.keys(body);
     if (body.action === "check") {
-      // selfUpdateSupported: whether "Update now" can run here (never in the compiled binary, lib/self-update.ts).
-      return Response.json({ ...await checkOmpUpdate(body.force === true), selfUpdateSupported: getSelfUpdateSupport().supported });
+      // The compiled web updater does not enable the legacy runtime-only package worker.
+      return Response.json({ ...await checkOmpUpdate(body.force === true), selfUpdateSupported: getSelfUpdateSupport(OMP_KIND).supported });
     }
     if (body.action === "restart" && keys.length === 1) {
       const sessionsRestarted = await restartAllRpcSessions();

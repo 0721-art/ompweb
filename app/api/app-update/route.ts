@@ -1,6 +1,9 @@
 import { isApiRequestOriginAllowed, shouldCheckApiRequestOrigin } from "@/lib/request-security";
 import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
 import { checkNpmUpdate } from "@/lib/npm-update";
+import { checkPrereleaseUpdate } from "@/lib/ompweb-releases";
+import { getGithubToken } from "@/lib/github-token";
+import { getHostUpdateSettings } from "@/lib/hosts/hub";
 import {
   abortPreparedSelfUpdate,
   acknowledgeSelfUpdate,
@@ -15,6 +18,11 @@ import {
 } from "@/lib/self-update";
 
 type CommitResult = { accepted: true; attemptId: string };
+
+async function serverUpdateChannel(): Promise<"stable" | "prerelease"> {
+  try { return (await getHostUpdateSettings("local")).ompwebChannel; }
+  catch { return "stable"; }
+}
 
 async function commitAppUpdate(attemptId: string): Promise<CommitResult> {
   let launcherArmed = false;
@@ -45,7 +53,8 @@ function errorResponse(error: unknown): Response {
 
 export async function GET(request: Request) {
   const force = new URL(request.url).searchParams.get("force") === "1";
-  const status = await checkNpmUpdate(force);
+  const channel = await serverUpdateChannel();
+  const status = channel === "prerelease" ? await checkPrereleaseUpdate(force, getGithubToken()) : await checkNpmUpdate(force);
   const support = getSelfUpdateSupport();
   const selfUpdateStatus = status.updatesDisabled ? null : getSelfUpdateStatus();
   return Response.json({
@@ -67,7 +76,7 @@ export async function POST(request: Request) {
     if (!body || typeof body !== "object" || Array.isArray(body)) throw new SelfUpdateError("invalid_action", "action must be prepare, commit, status, or acknowledge");
     const keys = Object.keys(body);
     if (body.action === "prepare" && keys.length === 1) {
-      const result = await prepareSelfUpdate();
+      const result = await prepareSelfUpdate("app", { channel: await serverUpdateChannel(), token: getGithubToken() });
       return Response.json(result, { status: 202 });
     }
     if (body.action === "acknowledge" && keys.length === 2 && typeof body.attemptId === "string") {

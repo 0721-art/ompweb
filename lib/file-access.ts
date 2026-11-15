@@ -88,6 +88,7 @@ export function getConfigAgentRoots(): string[] {
  */
 const OMP_ENV_NAME = /^\.env(?:\.|$)/i;
 const OMP_SECRET_NAME = /^(?:\.?agent\.db(?:[-.~].*)?|\.?models\.(?:yml|yaml|json)(?:[.~].*|-(?:backup|bak|old)(?:[.~-].*)?)?|\.env(?:\..*)?)$/i;
+const WEB_SECRET_NAME = /^\.?github-token\.json(?:[.~].*)?$/i;
 const credentialPolicyUnavailable = () => new HostOpError(503, "credential_policy_unavailable", "Credential exclusions cannot be verified while their filesystem metadata is unreadable");
 
 /** Request metadata failures retain a 404; incomplete credential ownership metadata throws a 503. */
@@ -106,11 +107,13 @@ export function isOmpSecretFile(filePath: string): boolean {
   const agentDirs = [getAgentDir(), ...configDirs.map((dir) => path.join(dir, "agent"))];
   const requestedIdentity = fileIdentity(filePath, markRequestUnavailable);
   const identity = requestedIdentity && requestedIdentity.nlink > 1 && requestedIdentity.ino > 0 ? requestedIdentity : null;
-  for (const dir of new Set([...agentDirs, ...configDirs])) {
+  const webDirs = agentDirs.map((dir) => path.join(dir, "omp-web"));
+  for (const dir of new Set([...agentDirs, ...configDirs, ...webDirs])) {
     const agentDir = agentDirs.includes(dir);
-    const namePattern = agentDir ? OMP_SECRET_NAME : OMP_ENV_NAME;
+    const webDir = webDirs.includes(dir);
+    const namePattern = webDir ? WEB_SECRET_NAME : agentDir ? OMP_SECRET_NAME : OMP_ENV_NAME;
     if (namePattern.test(name) && (parents.has(comparablePath(dir)) || parents.has(comparablePath(resolvedOrSelf(dir, markUnavailable))))) return true;
-    const names = new Set(agentDir ? ["agent.db", "models.yml", "models.yaml", "models.json", ".env"] : [".env"]);
+    const names = new Set(webDir ? ["github-token.json"] : agentDir ? ["agent.db", "models.yml", "models.yaml", "models.json", ".env"] : [".env"]);
     try {
       for (const entry of readdirSync(dir, { encoding: "buffer" })) {
         const name = entry.toString("utf8");

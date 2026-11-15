@@ -2,6 +2,7 @@ import type { SkillInstallScope } from "@/lib/api-types";
 import { checkSkillUpdates } from "@/lib/skill-updates";
 import { loadSkillsWithInstallInfo } from "@/lib/skills-service";
 import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-access";
+import { getGithubToken } from "@/lib/github-token";
 
 export async function POST(req: Request) {
   try {
@@ -36,7 +37,7 @@ export async function POST(req: Request) {
     }
 
     const updates = await checkSkillUpdates(installs, {
-      githubToken: process.env.GITHUB_TOKEN || process.env.GH_TOKEN,
+      githubToken: getGithubToken(),
     });
     return Response.json({ updates });
   } catch (error) {

@@ -1,6 +1,7 @@
 "use client";
 
 import { ToggleSwitch } from "@/components/ui/ToggleSwitch";
+import { GithubTokenSettings } from "./GithubTokenSettings";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useTransition, cloneElement, isValidElement, type ReactElement, type ReactNode } from "react";
 import { getSubmitDuringRunBehavior, getWordCompletionMode, setSubmitDuringRunBehavior, setWordCompletionMode, type SubmitDuringRunBehavior, type WordCompletionMode } from "@/lib/composer-prefs";
@@ -158,6 +159,7 @@ type SettingIndexEntry = {
 
 const SETTING_INDEX: SettingIndexEntry[] = [
   // Interface & Behavior
+  { id: "github-token", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.githubToken", descKey: "settingsConfig.githubTokenDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "GitHub token", fallbackDesc: "Server-wide token for GitHub API calls. Create a fine-grained personal access token for Public repositories (read-only), with no permissions." },
   { id: "skill-startup-notices", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.skillStartupNotices", descKey: "settingsConfig.skillStartupNoticesDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Skill startup notices", fallbackDesc: "Show conflicts and redundant skill copies when an OMP session starts.", scope: "Native OMP" },
   { id: "completion-sound", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.completionSound", descKey: "settingsConfig.completionSoundDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Completion sound", fallbackDesc: "Play a tone when the agent completes a run.", scope: "UI" },
   { id: "keep-tool-calls-collapsed", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.keepToolCallsCollapsed", descKey: "settingsConfig.keepToolCallsCollapsedDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Keep tool calls collapsed", fallbackDesc: "Show only compact headers while tools execute.", scope: "UI" },
@@ -1444,6 +1446,9 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                     </select>
                   </NativeSetting>
                   <BrowserTransportSetting />
+                  <NativeSetting searchId="github-token" label={t("settingsConfig.githubToken")} description={t("settingsConfig.githubTokenDesc")}>
+                    <GithubTokenSettings />
+                  </NativeSetting>
                   <NativeSetting searchId="connection-diagnostics" label={t("settingsConfig.connectionDiagnostics")} description={t("settingsConfig.connectionDiagnosticsDesc")} scope="UI">
                     <ToggleSwitch checked={connectionDiagnostics} onChange={setConnectionDiagnosticsEnabled} />
                   </NativeSetting>

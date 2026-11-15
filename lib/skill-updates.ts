@@ -3,6 +3,8 @@ import { mkdtemp, rm } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { promisify } from "util";
+import { githubFetch } from "./github-fetch";
+import { getGithubToken } from "./github-token";
 import type {
   SkillInstallInfo,
   SkillUpdateResult,
@@ -220,7 +222,7 @@ export async function checkSkillUpdate(
 
   const resolvedOptions = {
     ...options,
-    fetcher: options.fetcher ?? fetch,
+    fetcher: options.fetcher ?? ((input: string, init?: RequestInit) => githubFetch(input, init, options.githubToken ?? getGithubToken())),
     skillsApiBase: options.skillsApiBase ?? DEFAULT_SKILLS_API_BASE,
     resolveGitTreeHash: options.resolveGitTreeHash ?? resolveGitTreeHash,
   };
@@ -243,7 +245,7 @@ export async function checkSkillUpdates(
   installs: SkillInstallInfo[],
   options: CheckOptions = {},
 ): Promise<SkillUpdateResult[]> {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher: Fetcher = options.fetcher ?? ((input, init) => githubFetch(input, init, options.githubToken ?? getGithubToken()));
   const requests = new Map<string, Promise<Response>>();
   const cachedFetcher: Fetcher = async (input, init) => {
     let request = requests.get(input);

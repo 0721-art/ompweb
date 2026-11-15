@@ -1,5 +1,6 @@
 import type { NpmUpdateStatus } from "../npm-update";
 import type { OmpUpdateStatus } from "../omp/updates";
+import type { HostUpdateSettings } from "./update-settings";
 
 export type HostUpdateTarget = "ompweb" | "omp";
 
@@ -31,4 +32,7 @@ export interface HostUpdateInfo {
   ompweb: HostSoftwareUpdate & Pick<NpmUpdateStatus, "installMethod"> & { protocolVersion: number | null };
   omp: HostSoftwareUpdate & Pick<OmpUpdateStatus, "updatesDisabled">;
   operation: HostUpdateOperation | null;
+  /** Absent on older daemons: only the upstream/stable defaults are supported. */
+  settings?: HostUpdateSettings;
+  githubTokenRejected?: boolean;
 }

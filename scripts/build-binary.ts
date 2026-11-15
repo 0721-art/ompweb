@@ -2,10 +2,12 @@
 // release/ompweb-<os>-<arch>/ompweb (ompweb.exe for Windows) next to the files it serves and hands to omp and the
 // licenses of what it redistributes, then archives that directory as release/ompweb-<os>-<arch>.tar.gz (.zip for
 // Windows). Default target: this machine.
-import { cpSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { bundledPackageDirs, writeLicenses } from "./licenses";
+import { execFileSync } from "node:child_process";
+import { createGitEnvironment } from "../lib/project-command-env";
 
 const root = path.join(import.meta.dir, "..");
 const { values } = parseArgs({ args: Bun.argv.slice(2), options: { target: { type: "string" } } });
@@ -29,6 +31,10 @@ if (!existsSync(bunLicense)) {
   process.exit(1);
 }
 
+let sha = "";
+try { sha = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8", env: createGitEnvironment(), stdio: ["ignore", "pipe", "pipe"] }).trim(); } catch { /* Source archives may not carry Git metadata. */ }
+const builtAt = new Date().toISOString();
+
 const result = await Bun.build({
   entrypoints: [path.join(root, "server", "binary.ts")],
   // A .env or bunfig.toml in the directory ompweb is started from belongs to the user's project, not to ompweb.
@@ -37,11 +43,16 @@ const result = await Bun.build({
   // the server never writes the local daemon link (instrumentation.node.ts), so no session ever lists.
   minify: true,
   metafile: true,
-  define: { "process.env.NODE_ENV": JSON.stringify("production") },
+  define: {
+    "process.env.NODE_ENV": JSON.stringify("production"),
+    "process.env.OMP_WEB_BUILD_SHA": JSON.stringify(sha),
+    "process.env.OMP_WEB_BUILD_DATE": JSON.stringify(builtAt),
+  },
   throw: false,
 });
 for (const log of result.logs) console.log(log);
 if (!result.success) process.exit(1);
+writeFileSync(path.join(out, "ompweb-build.json"), JSON.stringify({ sha, builtAt }) + "\n");
 
 // The static root (server/binary.ts): the client, the public files, the extension the daemon hands omp, the KaTeX CSS
 // and fonts (where the server resolves the katex package), and the licenses of what ships.

@@ -1,6 +1,6 @@
 // The compiled `ompweb` (scripts/build-binary.ts): the web server by default, with the npm launcher's flags and
 // password env, `ompweb host` (the session daemon) and `ompweb hash-password`. The server runs in this process: there
-// is no launcher, so no in-app update, tray or service installer. Static root: the directory the executable sits in
+// is no launcher, tray or service installer. Binary updates use a copied worker or OMP_WEB_SELF_UPDATE_CMD. Static root: the directory the executable sits in
 // (dist/, public/, node_modules/katex/, lib/omp/session-edit-extension.mjs), unless OMP_WEB_PACKAGE_DIR names another.
 import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
@@ -10,6 +10,7 @@ import { runHashPasswordCommand } from "../bin/omp-web-hash-password";
 import { checkLaunchSecurity, parseLaunchOptions } from "../bin/omp-web-options";
 import { runHostCli } from "@/lib/hosts/host-cli";
 import { runHostUpdateWorker } from "../lib/hosts/update-worker";
+import { runSelfUpdateWorker } from "../bin/omp-web-update-worker.js";
 
 // Before any server module loads: app/api/manifest reads public/ from it when it loads, and the daemon names
 // lib/omp/session-edit-extension.mjs in it to omp.
@@ -18,6 +19,14 @@ const root = process.env.OMP_WEB_PACKAGE_DIR;
 const SEE_README = "https://github.com/kahme247/ompweb#single-binary shows how to run `ompweb` and `ompweb host` as services instead.";
 
 const command = process.argv[2];
+if (command === "self-update-worker") {
+  await runSelfUpdateWorker();
+  process.exit(0);
+}
+if (command === "--version" || command === "-v") {
+  console.log(`${packageJson.version}${process.env.OMP_WEB_BUILD_SHA ? ` (${process.env.OMP_WEB_BUILD_SHA})` : ""}`);
+  process.exit(0);
+}
 if (command === "host-update-worker") {
   process.exit(await runHostUpdateWorker(process.argv[3] || ""));
 }

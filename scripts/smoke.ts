@@ -238,13 +238,13 @@ try {
     });
 
     if (binary) {
-      await step("the binary points updates at the release page and offers no in-app update", async () => {
+      await step("the binary offers web updates while legacy runtime updates remain unsupported", async () => {
         const update = await (await fetch(`${base}/api/app-update`)).json() as { installMethod?: string; selfUpdateSupported?: boolean; updateCommand?: string };
-        assert(update.installMethod === "binary" && update.selfUpdateSupported === false, JSON.stringify(update));
+        assert(update.installMethod === "binary" && update.selfUpdateSupported === true, JSON.stringify(update));
         assert(update.updateCommand?.startsWith("https://github.com/kahme247/ompweb/releases"), `updateCommand ${update.updateCommand}`);
         const ompCheck = await (await fetch(`${base}/api/omp-update`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "check" }) })).json() as { selfUpdateSupported?: boolean };
         assert(ompCheck.selfUpdateSupported === false, `omp update check: ${JSON.stringify(ompCheck)}`);
-        // Started, the worker would run on this binary: a second ompweb, not the update.
+        // The legacy runtime worker still requires an external Node/package installation.
         const response = await fetch(`${base}/api/omp-update`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "update" }) });
         assert(response.status === 409, `POST /api/omp-update update: status ${response.status}`);
       });

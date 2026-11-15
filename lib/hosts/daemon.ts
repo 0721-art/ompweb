@@ -17,8 +17,9 @@ import { CREATION_ID_RE, encodeLine, HostOpError, isHostOp, LINK_LIMITS, LINK_PR
 import { localHost, resolveSpawnCwdResult } from "./local-host";
 import { sessionOps } from "./session-ops";
 import packageJson from "../../package.json";
-import { checkHostUpdates, configureHostUpdateSafety, getHostUpdateOperation, HostUpdateError, startHostUpdate } from "./updates";
+import { checkHostUpdates, configureHostUpdateSafety, getHostUpdateOperation, HostUpdateError, saveHostUpdateSettings, startHostUpdate } from "./updates";
 import type { HostUpdateCompatibility, HostUpdateOperation } from "./update-types";
+import { isHostUpdateSettings, readHostUpdateSettings } from "./update-settings";
 import { UploadRetention } from "./upload-retention";
 import { StagedUploads, UPLOAD_SWEEP_INTERVAL_MS } from "./uploads";
 import { isWorkspaceOp, WORKSPACE_OP_PARAMS } from "../workspace-types";
@@ -328,10 +329,17 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
       case "invalidateSessionLists": invalidateWorkspaceRoots(); localHost.invalidateSessionLists(args.path === undefined ? undefined : sessionsPath(args.path)); sessionsChanged(); return;
       case "checkUpdates":
         if (args.force !== undefined && typeof args.force !== "boolean") throw new HostOpError(400, "invalid_request", "force must be a boolean");
-        return checkHostUpdates(updateCompatibility(args.compatibility), args.force === true);
+        if (args.githubToken !== undefined && (typeof args.githubToken !== "string" || args.githubToken.length > 1024)) throw new HostOpError(400, "invalid_request", "Invalid GitHub token");
+        return checkHostUpdates(updateCompatibility(args.compatibility), args.force === true, args.githubToken as string | undefined);
       case "updateSoftware":
         if ((args.target !== "ompweb" && args.target !== "omp") || typeof args.version !== "string") throw new HostOpError(400, "invalid_request", "Invalid host update");
-        return startHostUpdate(args.target, args.version, updateCompatibility(args.compatibility));
+        if (args.githubToken !== undefined && (typeof args.githubToken !== "string" || args.githubToken.length > 1024)) throw new HostOpError(400, "invalid_request", "Invalid GitHub token");
+        return startHostUpdate(args.target, args.version, updateCompatibility(args.compatibility), args.githubToken as string | undefined);
+      case "getUpdateSettings": return readHostUpdateSettings();
+      case "setUpdateSettings":
+        if (!isHostUpdateSettings(args.settings)) throw new HostOpError(400, "invalid_request", "Invalid host update settings");
+        if (getHostUpdateOperation()?.state === "running") throw new HostOpError(409, "host_updating", "This host is updating");
+        return saveHostUpdateSettings(args.settings);
       case "preparePoolProject": {
         if (getHostUpdateOperation()?.state === "running") throw new HostUpdateError("host_updating", "This host is updating; new project preparation must wait");
         preparationsInFlight++;
