@@ -7,6 +7,7 @@ import { baselineCursor, capName } from "./events";
 import { checkGh, defaultGhRunner, formatTarget, parseGithubTarget, type GhRunner, type GithubTarget } from "./gh";
 import { fetchReviewComment, fetchSnapshot, fetchThread, postComment, readItem, resolveThread, type ReadPart } from "./api";
 import { MAX_WATCHES_PER_SESSION, beginWatchIntent, cancelWatchIntent, grantRead, hasReadGrant, itemKeyOf, recordPosted, registerWatchIntent, removeWatch, repoKeyOf, whilePosting } from "./watch-store";
+import { ACTION_READ_TOOLS, ACTION_TOOL_DEFINITIONS, executeActionTool } from "./action-tools";
 
 /**
  * The five GitHub agent tools (docs/specs/2026-11-13-github-watch-tool-design.md),
@@ -14,10 +15,10 @@ import { MAX_WATCHES_PER_SESSION, beginWatchIntent, cancelWatchIntent, grantRead
  * after its enabled and rate checks.
  */
 
-export const GITHUB_TOOL_NAMES = new Set(["watch_github", "unwatch_github", "github_read", "github_comment", "github_resolve_thread"]);
+export const GITHUB_TOOL_NAMES = new Set(["watch_github", "unwatch_github", "github_read", "github_comment", "github_resolve_thread", ...ACTION_TOOL_DEFINITIONS.map(tool => tool.name)]);
 
 /** Idempotent tools: a replay after a server restart may run them again; the writes may already have happened. */
-export const GITHUB_REPLAY_SAFE_TOOLS = new Set(["watch_github", "unwatch_github", "github_read"]);
+export const GITHUB_REPLAY_SAFE_TOOLS = new Set(["watch_github", "unwatch_github", "github_read", ...ACTION_READ_TOOLS]);
 
 const MAX_COMMENT_CHARS = 65_536;
 const MAX_READ_IDS = 100;
@@ -29,6 +30,7 @@ const TARGET_DESCRIPTION = "OWNER/REPO#N, or a https://github.com/OWNER/REPO/pul
 const target = { type: "string", description: TARGET_DESCRIPTION };
 
 export const GITHUB_TOOL_DEFINITIONS: HostToolDefinition[] = [
+  ...ACTION_TOOL_DEFINITIONS,
   {
     name: "watch_github",
     description:
@@ -116,7 +118,7 @@ function parseIds(value: unknown): string[] | undefined {
 }
 
 /** A local session never asks; a remote one asks once per repository unless its host lets agents in. */
-async function allowRead(ops: GithubToolOps, ctx: AgentToolContext, t: GithubTarget): Promise<void> {
+async function allowRead(ops: GithubToolOps, ctx: AgentToolContext, t: Pick<GithubTarget, "owner" | "repo">): Promise<void> {
   if (ctx.sourceHostId === "local") return;
   const repoKey = repoKeyOf(t);
   if (hasReadGrant(ctx.sourceSessionId, repoKey)) return;
@@ -138,6 +140,7 @@ async function allowWrite(ops: GithubToolOps, ctx: AgentToolContext, title: stri
 /** validate → gh check → permission → act. */
 export async function executeGithubTool(name: string, args: Record<string, unknown>, ops: GithubToolOps, ctx: AgentToolContext): Promise<unknown> {
   if (!readAgentToolsEnabledFromDisk()) throw new Error('Agent tools are disabled. Enable "Agent tools" in omp-web Settings (System) first.');
+  if (ACTION_TOOL_DEFINITIONS.some(tool => tool.name === name)) return executeActionTool(name, args, ops, ctx, target => allowRead(ops, ctx, target));
   if (name === "github_resolve_thread") {
     const threadId = stringArg(args, "threadId");
     if (!/^PRRT_[A-Za-z0-9_-]{1,200}$/.test(threadId)) throw new Error('Agent tool argument "threadId" is not a review thread id (PRRT_...).');

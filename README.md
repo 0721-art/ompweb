@@ -102,6 +102,29 @@ jobs (`include: ["checks"]`), and `unwatch_github` to stop watching. Run comment
 other read parts, and subscriptions to future runs of a workflow are not supported.
 Remote sessions use the same per-repository read confirmation as PRs and issues.
 
+For manual runs, use `github_workflow_list` to discover workflows and
+`github_workflow_read` with a branch or tag to inspect dispatch inputs.
+`github_workflow_dispatch` takes `repo`, `workflow`, `ref` and optional `inputs`,
+and returns the exact created run ID and URL. Pass that URL to `watch_github`.
+`github_run_list` finds existing runs; `github_run_cancel` requests cancellation;
+`github_run_rerun` requests all or failed jobs, or a specific job and its dependents.
+A rerun retains its run ID: read until the new attempt appears before watching it.
+
+Settings → System controls dispatch, cancellation and rerun independently:
+**Blocked**, **Ask each time** (default), or **Allow without asking**.
+The comment-writing switch does not authorize these operations. These controls
+limit agent actions through omp-web, not the server account's GitHub privileges.
+GitHub refusals retain the reported reason and available permission, SSO or
+rate-limit evidence; a 403 alone is not treated as a missing token scope.
+Fine-grained credentials need Actions write for these mutations; classic/OAuth
+credentials use `repo`. The classic `workflow` scope is for editing workflow
+files, not dispatching them. omp-web does not change credentials automatically.
+
+Mutation requests are recorded before sending and are never automatically
+replayed after an uncertain result. Inspect the existing runs before issuing a
+new dispatch or rerun. Confirmation inputs and explicit workflow reads are not
+secret channels: do not pass credentials as workflow inputs.
+
 ## Quick Start
 
 **Run directly without installing:**
