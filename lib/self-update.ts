@@ -529,8 +529,8 @@ async function startSelfUpdate(attemptId: string, approval: UpgradeApproval, res
     if (localHost.kind !== "separate" && !serverUrl) throw unsupported("The local host's link to this server could not be identified");
     await controllable("The detached update worker cannot be started safely", () =>
       launchDetachedUpgrade({ command: process.execPath, args: ["--version"], cwd: install.installDir, env: helperEnvironment() }));
-    // Stopping the shared host interrupts what it runs (the approval required Force for it); null (unknown) counts as work.
-    const interruptSessions = localHost.kind === "shared" && local !== null && (local.sessionProcesses !== 0 || local.activeTurns !== 0);
+    // Unknown activity is not consent: only explicit Force permits interruption.
+    const interruptSessions = confirmed.force && localHost.kind === "shared" && local !== null && (local.sessionProcesses !== 0 || local.activeTurns !== 0);
 
     const attemptDir = join(attemptsDir(true)!, attemptId);
     mkdirSync(attemptDir, { mode: 0o700, recursive: true });
