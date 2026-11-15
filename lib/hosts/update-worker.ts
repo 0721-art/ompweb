@@ -463,7 +463,7 @@ export async function sharedHostInstallReason(installDir: string, ignoredPids: n
   try {
     // Cold CIM startup can exceed five seconds on contended Windows hosts.
     const { stdout } = process.platform === "win32"
-      ? await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress"], { timeout: 20000, maxBuffer: 8 * 1024 * 1024, windowsHide: true })
+      ? await exec(join(process.env.SystemRoot || process.env.windir || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"), ["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine)"], { timeout: 20000, maxBuffer: 8 * 1024 * 1024, windowsHide: true, env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(?:PSModulePath|PSHOME)$/i.test(key))) })
       : await exec("ps", ["-axo", "pid=,ppid=,command="], { timeout: 5000, maxBuffer: 8 * 1024 * 1024 });
     const rows: { pid: number; ppid: number; command: string; executable?: string }[] = process.platform === "win32"
       ? (JSON.parse(stdout) as { ProcessId: number; ParentProcessId: number; CommandLine: string; ExecutablePath: string }[]).map((row) => ({ pid: row.ProcessId, ppid: row.ParentProcessId, command: row.CommandLine || "", executable: row.ExecutablePath }))
@@ -670,7 +670,7 @@ async function waitUnshared(installDir: string): Promise<void> {
     if (Date.now() > deadline) throw new Error(`${sharing} Stopping the host did not free it.`);
   }
 }
-/** Renames a release directory. Windows keeps a directory while any file in it is open (a process still exiting, a virus scan): retry briefly, then fail with the original error. */
+/** Renames a release directory. Windows handles without delete sharing can briefly block it (an exiting process or virus scan): retry, then fail with the original error. */
 export async function moveHostRelease(from: string, to: string): Promise<void> {
   for (let attempt = 0; ; attempt++) {
     try { return renameSync(from, to); }

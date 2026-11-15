@@ -267,8 +267,9 @@ exit $code
 }
 
 /**
- * The command the legacy runner's native `bash` operation runs. It only invokes Windows PowerShell there: Git Bash is
- * the transport, so MSYS argument rewriting is switched off and powershell.exe falls back to its System32 path.
+ * The command the legacy runner's native `bash` operation runs (the pinned runner uses the embedded POSIX shell).
+ * It only invokes Windows PowerShell; MSYS rewriting is disabled if transported through Git Bash instead.
+ * powershell.exe falls back to its System32 path.
  */
 function windowsCommand(plan: Plan, base: string): string {
   const encoded = Buffer.from(windowsScript(plan, base), "utf16le").toString("base64");

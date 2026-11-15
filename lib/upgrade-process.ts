@@ -52,8 +52,15 @@ const SHELL = /^(?:sh|bash|zsh|dash|ksh|fish|tcsh|csh)$/;
 
 function fail(message: string): never { throw new Error(message); }
 const messageOf = (error: unknown): string => {
-  const stderr = (error as { stderr?: unknown } | null)?.stderr;
-  return (typeof stderr === "string" && stderr.trim()) || (error instanceof Error ? error.message : String(error));
+  const failure = error as { stderr?: unknown; stdout?: unknown; code?: unknown; signal?: unknown; killed?: boolean } | null;
+  for (const output of [failure?.stderr, failure?.stdout]) {
+    const text = typeof output === "string" ? output.trim() : Buffer.isBuffer(output) ? output.toString("utf8").trim() : "";
+    if (text) return text.replace(/-EncodedCommand\s+\S+/gi, "-EncodedCommand [redacted]").slice(0, 1000);
+  }
+  const text = error instanceof Error ? error.message : String(error);
+  // execFile's fallback embeds the whole script, hiding the useful termination reason and possibly exposing launch data.
+  if (/-EncodedCommand\b/i.test(text)) return `Process failed (code ${failure?.code ?? "unknown"}${failure?.signal ? `, signal ${failure.signal}` : ""}${failure?.killed ? ", killed" : ""}); no diagnostic output`;
+  return text.slice(0, 1000);
 };
 function sha256(...parts: (string | Buffer)[]): string {
   const hash = createHash("sha256");
@@ -849,7 +856,12 @@ export async function restartUpgradeProcess(plan: UpgradeProcess, launch: Upgrad
     case "foreground": {
       const pid = await launchDetachedUpgrade(launch);
       const identity = pid === undefined ? null : await processStartIdentity(pid);
-      if (pid === undefined || !identity) fail(`The restarted process ${pid ?? ""} is not running`);
+      if (pid === undefined || !identity) {
+        // A fast-exiting candidate must not leave cleanup inspecting the old pid, which Windows can already have reused.
+        if (pid !== undefined && !(await isRunning(pid))) plan.current = { pid: null, identity: null };
+        else if (pid !== undefined) plan.current = { pid, identity: "" }; // live but unverified: stop refuses to signal it
+        fail(`The restarted process ${pid ?? ""} is not running or its start identity cannot be read`);
+      }
       instance = { pid, identity };
       break;
     }
