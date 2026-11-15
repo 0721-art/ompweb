@@ -380,6 +380,30 @@ interface CommitJob {
   interruptSessions: boolean;
 }
 
+interface RecoveryJob {
+  attemptId: string;
+  install: ServerInstall;
+  launch: Omit<UpgradeLaunch, "env">;
+  server: ServerUpdateDescriptor["server"]["process"];
+}
+
+/** A shared agent directory is not permission to recover another installation or listener. */
+async function ownsRecoveryJob(job: Partial<RecoveryJob>): Promise<boolean> {
+  try {
+    const install = resolveServerInstall();
+    const { launch, viaLauncher } = serverRestart(install);
+    if (JSON.stringify(job.install) !== JSON.stringify(install) || JSON.stringify(job.launch) !== JSON.stringify(launch) || !job.server) return false;
+    const launcherPid = Number(process.env.OMP_WEB_LAUNCHER_PID);
+    const top = viaLauncher && launcherPid === process.ppid ? launcherPid : process.pid;
+    const current = await inspectUpgradeProcess({ pid: top, installDir: install.installDir, role: "server", launch });
+    if (JSON.stringify(current.supervisor) !== JSON.stringify(job.server.supervisor)) return false;
+    if (job.server.pid === current.pid) return job.server.identity === current.identity;
+    return job.server.pid !== null && !isProcessAlive(job.server.pid);
+  } catch {
+    return false; // An unrelated or unverifiable startup must not fail the approved attempt.
+  }
+}
+
 /** A copy of the compiled binary outside the installation, or a self-contained Node bundle of the worker: either runs after the installation it came from is replaced. */
 async function workerLaunch(job: CommitJob, attemptDir: string, descriptor: string): Promise<UpgradeLaunch> {
   const { install } = job;
@@ -511,7 +535,7 @@ async function startSelfUpdate(attemptId: string, approval: UpgradeApproval, res
     const attemptDir = join(attemptsDir(true)!, attemptId);
     mkdirSync(attemptDir, { mode: 0o700, recursive: true });
     await securePrivateDirectory(attemptDir);
-    atomicWrite(join(attemptDir, "job.json"), JSON.stringify({ attemptId }));
+    atomicWrite(join(attemptDir, "job.json"), JSON.stringify({ attemptId, install, launch, server: serverProcess } satisfies RecoveryJob));
     // Persist approval only after controllability and private-state checks pass.
     if (!resuming) await approveUpgradePlan(attemptId, confirmed);
     const releasePin = getApprovedReleasePin(attemptId);
@@ -550,8 +574,8 @@ export async function resumeCoordinatedSelfUpdate(): Promise<void> {
       const lease = readStateJson<{ attemptId?: string; expiresAt?: unknown }>(leasePath());
       if (live?.attemptId !== status.attemptId || live.state !== "running" || live.workerPid !== undefined
         || isProcessAlive(live.coordinatorPid) || lease?.attemptId !== status.attemptId || !isActiveLease(lease)) return;
-      const currentJob = readStateJson<{ attemptId?: string }>(join(attemptsDir(false) ?? "", live.attemptId, "job.json"));
-      if (currentJob?.attemptId !== live.attemptId) return;
+      const currentJob = readStateJson<Partial<RecoveryJob>>(join(attemptsDir(false) ?? "", live.attemptId, "job.json"));
+      if (currentJob?.attemptId !== live.attemptId || !await ownsRecoveryJob(currentJob)) return;
       ownsRecovery = true;
       const plan = getUpgradePlan(live.attemptId);
       if (!plan?.approved) throw new Error("The interrupted upgrade has no stored approval");
