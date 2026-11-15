@@ -257,6 +257,9 @@ async function signalProcess(pid: number, signal: NodeJS.Signals): Promise<void>
 function isHostCommand(args: string[]): boolean {
   return args.slice(0, 4).some((arg, index) => basename(arg.replaceAll("\\", "/")) === "omp-web-host.js" || (index > 0 && arg === "host"));
 }
+function runsInstallScript(args: string[], installDir: string, script: string): boolean {
+  return args.slice(0, 4).some((arg) => !arg.startsWith("-") && inside(join(installDir, script), isAbsolute(arg) ? arg : resolve(installDir, arg)));
+}
 /** Its executable, or a script/argument among the first few, lies in the installation (a node/bun runtime elsewhere runs a script inside it). */
 function belongsToInstall(row: ProcessInfo, installDir: string): boolean {
   if (row.exe && inside(installDir, row.exe)) return true;
@@ -306,6 +309,7 @@ function descendants(rows: ProcessInfo[], root: number, includeRoot: boolean): n
 /** The single new instance a supervisor started (not the one stopped), within the processes `within` allows; nulls when none or several qualify by the deadline. */
 async function waitForInstance(plan: UpgradeProcess, within: (rows: ProcessInfo[]) => number[] | Promise<number[]>, timeout: number, stillSupervised?: () => Promise<void>): Promise<UpgradeInstance> {
   const deadline = Date.now() + timeout;
+  const packageLauncher = plan.role === "server" && runsInstallScript(plan.args, plan.installDir, "bin/omp-web.js");
   for (;;) {
     await stillSupervised?.();
     const rows = await listProcesses();
@@ -313,6 +317,7 @@ async function waitForInstance(plan: UpgradeProcess, within: (rows: ProcessInfo[
     const found: UpgradeInstance[] = [];
     for (const row of rows) {
       if (!allowed.has(row.pid) || row.state === "Z" || isHostCommand(row.args) !== (plan.role === "host") || !belongsToInstall(row, plan.installDir)) continue;
+      if (packageLauncher && !runsInstallScript(row.args, plan.installDir, "bin/omp-web.js")) continue;
       const identity = await processStartIdentity(row.pid);
       if (identity && (row.pid !== plan.pid || identity !== plan.identity) && (row.pid !== plan.current.pid || identity !== plan.current.identity)) found.push({ pid: row.pid, identity });
     }
@@ -859,12 +864,37 @@ export async function stopUpgradeProcess(plan: UpgradeProcess): Promise<void> {
     }
     case "restart-loop": {
       await verifyLoop(sup);
-      if (pid !== null && !descendants(await listProcesses(), sup.pid, false).includes(pid)) fail(`Process ${pid} is not run by the inspected restart loop; refusing to stop it`);
+      const rows = await listProcesses();
+      if (pid !== null && !descendants(rows, sup.pid, false).includes(pid)) fail(`Process ${pid} is not run by the inspected restart loop; refusing to stop it`);
+      let serverChild: UpgradeProcess | undefined;
+      if (pid !== null && plan.role === "server" && runsInstallScript(plan.args, plan.installDir, "bin/omp-web.js")) {
+        const children = rows.filter((row) => row.ppid === pid && row.state !== "Z" && belongsToInstall(row, plan.installDir) && !isHostCommand(row.args));
+        if (children.length > 1 || children.some((row) => !runsInstallScript(row.args, plan.installDir, "server/main.ts"))) fail("Cannot identify the package launcher's server child; refusing to stop its restart loop");
+        if (children.length === 1) {
+          const child = children[0], identity = await processStartIdentity(child.pid);
+          if (!identity) fail("Cannot verify the package launcher's server child");
+          serverChild = { ...plan, pid: child.pid, identity, executable: child.exe, args: child.args, supervisor: { kind: "foreground" }, current: { pid: child.pid, identity } };
+        }
+      }
       await signalProcess(sup.pid, "SIGSTOP");
+      let launcherFrozen = false;
       try {
+        if (serverChild && pid !== null) {
+          if (await runningInstance(plan) !== pid) fail("The package launcher exited before its server child could be stopped");
+          // Hold the launcher so its child's graceful exit cannot turn into exit 0 for the restart loop.
+          await signalProcess(pid, "SIGSTOP");
+          launcherFrozen = true;
+          await stopUpgradeProcess(serverChild);
+        }
         // SIGTERM would make the daemon exit 0, and the loop (README: exit 0 = stopped on purpose) would then end instead of restarting it.
         if (pid !== null) { await signalProcess(pid, "SIGKILL"); await waitStopped(pid); }
-      } catch (error) { await signalProcess(sup.pid, "SIGCONT").catch(() => undefined); throw error; }
+      } catch (error) {
+        if (launcherFrozen || (error as NodeJS.ErrnoException).code === "stop_pending") {
+          throw Object.assign(error instanceof Error ? error : new Error(String(error)), { code: "stop_pending" });
+        }
+        await signalProcess(sup.pid, "SIGCONT").catch(() => undefined);
+        throw error;
+      }
       return;
     }
     case "windows-task":
