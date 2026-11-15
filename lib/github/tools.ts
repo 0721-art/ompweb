@@ -7,7 +7,7 @@ import { baselineCursor, capName } from "./events";
 import { checkGh, defaultGhRunner, formatTarget, parseGithubTarget, type GhRunner, type GithubTarget } from "./gh";
 import { fetchReviewComment, fetchSnapshot, fetchThread, postComment, readItem, resolveThread, type ReadPart } from "./api";
 import { MAX_WATCHES_PER_SESSION, beginWatchIntent, cancelWatchIntent, grantRead, hasReadGrant, itemKeyOf, recordPosted, registerWatchIntent, removeWatch, repoKeyOf, whilePosting } from "./watch-store";
-import { ACTION_READ_TOOLS, ACTION_TOOL_DEFINITIONS, executeActionTool } from "./action-tools";
+import { ACTION_READ_TOOLS, ACTION_TOOL_DEFINITIONS, executeActionTool, GITHUB_REQUIREMENT as REQUIREMENT } from "./action-tools";
 
 /**
  * The five GitHub agent tools (docs/specs/2026-11-13-github-watch-tool-design.md),
@@ -24,8 +24,6 @@ const MAX_COMMENT_CHARS = 65_536;
 const MAX_READ_IDS = 100;
 const READ_PARTS: readonly ReadPart[] = ["summary", "comments", "reviews", "threads", "checks", "files", "diff"];
 
-const REQUIREMENT =
-  "Requires the GitHub CLI (`gh`) on the PATH of the omp-web server machine, logged in (`gh auth login`); acts as that account.";
 const TARGET_DESCRIPTION = "OWNER/REPO#N, or a https://github.com/OWNER/REPO/pull/N, /issues/N or /actions/runs/ID URL.";
 const target = { type: "string", description: TARGET_DESCRIPTION };
 
