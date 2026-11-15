@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { setTimeout as pause } from "node:timers/promises";
 import { promisify } from "node:util";
-import { isProcessAlive, processStartIdentity } from "./process-identity";
+import { processStartIdentity } from "./process-identity";
 
 const exec = promisify(execFile);
 
@@ -215,21 +215,35 @@ async function listProcesses(): Promise<ProcessInfo[]> {
 
 /** Alive and not a zombie: a frozen loop never reaps the process it was asked to stop. */
 async function isRunning(pid: number): Promise<boolean> {
-  if (!isProcessAlive(pid)) return false;
-  if (process.platform === "linux") {
-    try { const stat = readFileSync(`/proc/${pid}/stat`, "utf8"); return stat.slice(stat.lastIndexOf(")") + 2)[0] !== "Z"; } catch { return false; }
+  try { process.kill(pid, 0); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    return fail(`Cannot verify process ${pid}: ${messageOf(error)}`);
   }
   if (process.platform === "win32") return true;
   try {
+    if (process.platform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return stat.slice(stat.lastIndexOf(")") + 2)[0] !== "Z";
+    }
     const { stdout } = await exec("ps", ["-o", "stat=", "-p", String(pid)], { timeout: 5000, encoding: "utf8" });
-    return stdout.trim() !== "" && !stdout.trim().startsWith("Z");
-  } catch { return false; }
+    if (!stdout.trim()) throw new Error("No process status was returned");
+    return !stdout.trim().startsWith("Z");
+  } catch (error) {
+    try { process.kill(pid, 0); }
+    catch (gone) { if ((gone as NodeJS.ErrnoException).code === "ESRCH") return false; }
+    return fail(`Cannot verify process ${pid}: ${messageOf(error)}`);
+  }
 }
 async function waitStopped(pid: number, timeout = STOP_TIMEOUT_MS): Promise<void> {
   const deadline = Date.now() + timeout;
-  while (await isRunning(pid)) {
-    if (Date.now() > deadline) throw Object.assign(new Error(`Process ${pid} did not stop within ${timeout / 1000} seconds; it was not killed`), { code: "stop_pending" });
-    await pause(100);
+  try {
+    while (await isRunning(pid)) {
+      if (Date.now() > deadline) throw new Error(`Process ${pid} did not stop within ${timeout / 1000} seconds; it was not killed`);
+      await pause(100);
+    }
+  } catch (error) {
+    throw Object.assign(error instanceof Error ? error : new Error(String(error)), { code: "stop_pending" });
   }
 }
 async function signalProcess(pid: number, signal: NodeJS.Signals): Promise<void> {
@@ -799,9 +813,15 @@ export async function inspectUpgradeProcess(input: { pid: number; installDir: st
 /** The instance a stop would act on is still running and is the very process recorded (a recycled pid is never signalled). */
 async function runningInstance(plan: UpgradeProcess): Promise<number | null> {
   const { pid, identity } = plan.current;
-  if (pid === null || !(await isRunning(pid))) return null;
+  if (pid === null || !(await isRunning(pid))) {
+    if (plan.supervisor.kind === "foreground") plan.current = { pid: null, identity: null };
+    return null;
+  }
   if ((await processStartIdentity(pid)) !== identity) {
-    if (!(await isRunning(pid))) return null; // it exited while the identity was read
+    if (!(await isRunning(pid))) {
+      if (plan.supervisor.kind === "foreground") plan.current = { pid: null, identity: null };
+      return null;
+    }
     fail(`Process ${pid} is no longer the process that was inspected (process identity mismatch); refusing to signal it`);
   }
   return pid;
@@ -819,6 +839,7 @@ export async function stopUpgradeProcess(plan: UpgradeProcess): Promise<void> {
   switch (sup.kind) {
     case "foreground":
       if (pid !== null) { await signalProcess(pid, "SIGTERM"); await waitStopped(pid); }
+      plan.current = { pid: null, identity: null };
       return;
     case "systemd": {
       const props = await verifySystemd(sup);
@@ -885,8 +906,8 @@ export async function restartUpgradeProcess(plan: UpgradeProcess, launch: Upgrad
       const identity = pid === undefined ? null : await processStartIdentity(pid);
       if (pid === undefined || !identity) {
         // A fast-exiting candidate must not leave cleanup inspecting the old pid, which Windows can already have reused.
+        if (pid !== undefined) plan.current = { pid, identity: "" }; // unknown identity: cleanup must refuse to signal it
         if (pid !== undefined && !(await isRunning(pid))) plan.current = { pid: null, identity: null };
-        else if (pid !== undefined) plan.current = { pid, identity: "" }; // live but unverified: stop refuses to signal it
         fail(`The restarted process ${pid ?? ""} is not running or its start identity cannot be read`);
       }
       instance = { pid, identity };

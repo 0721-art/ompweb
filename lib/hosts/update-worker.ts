@@ -730,7 +730,7 @@ export async function moveHostRelease(from: string, to: string): Promise<void> {
 }
 /** The daemon's verified process and supervisor: the snapshot the claim persisted or, for a descriptor an earlier engine wrote, inspected now against its recorded identity. */
 async function daemonProcess(d: HostUpdateDescriptor, runtime: WorkerRuntime): Promise<UpgradeProcess> {
-  if (d.process) return d.process;
+  if (d.process) return { ...d.process, current: { ...d.process.current } };
   if (!runtime.identity.isProcessAlive(d.daemonPid)) throw new Error("The host daemon is no longer running, so its supervisor cannot be inspected; restart it manually");
   if (d.daemonIdentity && await runtime.identity.processStartIdentity(d.daemonPid) !== d.daemonIdentity) throw new Error("The recorded host daemon is no longer the process with this pid (process identity mismatch); refusing to signal it");
   return runtime.process.inspectUpgradeProcess({ pid: d.daemonPid, installDir: d.installDir, role: "host", launch: hostLaunch(d) });
@@ -805,7 +805,7 @@ async function launchDaemon(d: HostUpdateDescriptor, plan: UpgradeProcess, runti
     throw new Error("Host launch did not acknowledge healthy reconnect within 30 seconds");
   } catch (error) {
     try { await runtime.process.stopUpgradeProcess(plan); }
-    catch (stopError) { throw new UnsafeHostRestartError(`Failed candidate could not be stopped; backup retained, no duplicate daemon started: ${String(stopError)}`); }
+    catch (stopError) { throw new UnsafeHostRestartError(`Failed candidate could not be stopped; backup retained, no duplicate daemon started: ${String(stopError)}; original failure: ${String(error)}`); }
     throw error;
   }
 }
@@ -876,7 +876,7 @@ export async function runHostUpdateWorker(path: string): Promise<number> {
     let release: string | undefined;
     if (!d.restartOnly) {
       // The daemon's own sessions and subagents run the installed runner; stopping the daemon ends them, so they are not sharers. Anything else is.
-      const sharing = await sharedHostInstallReason(d.installDir, [process.pid], [d.daemonPid]);
+      const sharing = await sharedHostInstallReason(d.installDir, [process.pid], plan.current.pid === d.daemonPid ? [d.daemonPid] : []);
       if (sharing) throw new Error(`Update the web server first because this installation is shared. ${sharing}`);
       staging = join(dirname(d.installDir), `.ompweb-staging-${d.id}`);
       mkdirSync(staging, { mode: 0o700 });
@@ -885,7 +885,7 @@ export async function runHostUpdateWorker(path: string): Promise<number> {
       release = d.installMethod === "binary"
         ? await stageBinary({ version: d.version, releaseRepo: d.releaseRepo, releasePin: d.releasePin, requireReleasePin: d.requireReleasePin }, staging)
         : await stagePackage({ version: d.version, installMethod: d.installMethod, managerPath: d.managerPath, releasePin: d.releasePin, requireReleasePin: d.requireReleasePin }, staging);
-      const sharingAfterStage = await sharedHostInstallReason(d.installDir, [process.pid], [d.daemonPid]);
+      const sharingAfterStage = await sharedHostInstallReason(d.installDir, [process.pid], plan.current.pid === d.daemonPid ? [d.daemonPid] : []);
       if (sharingAfterStage) throw new Error(sharingAfterStage);
     }
     await preflightHostRelease(d, release ?? d.installDir);
@@ -899,7 +899,7 @@ export async function runHostUpdateWorker(path: string): Promise<number> {
       if (d.restartOnly && !(await installedHostVersionMatches(d.installMethod, d.installDir, d.version))) throw new Error(restartCandidateMissing);
       await runtime.process.assertUpgradeProcessControl(plan);
       if (release) {
-        const sharing = await sharedHostInstallReason(d.installDir, [process.pid], [d.daemonPid]);
+        const sharing = await sharedHostInstallReason(d.installDir, [process.pid], plan.current.pid === d.daemonPid ? [d.daemonPid] : []);
         if (sharing) throw new Error(sharing);
       }
     }
