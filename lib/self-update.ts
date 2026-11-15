@@ -1,7 +1,8 @@
 // The web server's side of an application update. prepare → plan (upgrade-plan.ts); commit → explicit approval, the
 // release staged and preflighted, the plan's other hosts updated, then a detached worker (server-update-worker.ts)
 // replaces this installation (binary, npm or bun) and the host sharing it, restarts both and proves them healthy.
-import { accessSync, chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { accessSync, chmodSync, closeSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { delimiter, dirname, basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,7 +15,7 @@ import { releaseRepo } from "./release-repo";
 import { captureLocalHost, insideInstall, reportPlan, serverArtifact, serverBinaryName, type ServerInstallMethod, type ServerUpdateDescriptor } from "./server-update-worker";
 import {
   atomicWrite, attemptsDir, ensureSecureRoot, isActiveLease, LEASE_MS, leasePath, markerPath, patchStatus, readStateJson, removeSecureEmptyDirectory, removeSecureFile,
-  renewLease, resolveSelfUpdateTempRoot, secureDirectory, SelfUpdateError, statusPath, type SelfUpdateStatus, type StoredStatus,
+  renewLease, resolveSelfUpdateTempRoot, secureDirectory, secureRegularFile, SelfUpdateError, statusPath, type SelfUpdateStatus, type StoredStatus,
 } from "./self-update-state";
 import { type UpgradeLaunch, assertUpgradeProcessControl, inspectUpgradeProcess, launchDetachedUpgrade, secureUpgradeDirectory } from "./upgrade-process";
 import { approveUpgradePlan, getApprovedReleasePin, getUpgradePlan, prepareUpgradePlan, removeUpgradePlan, upgradePlannedHosts } from "./upgrade-plan";
@@ -241,28 +242,33 @@ export function getSelfUpdateStatus(): SelfUpdateStatus | null {
 
 // ---------------------------------------------------------------- prepare
 
-/** One atomic gate for prepare/replacement/commit, including web processes sharing this agent directory. */
+/** SQLite holds the cross-process gate in the kernel; a crashed owner releases it without deleting a successor's lock. */
 async function withUpdateMutation<T>(run: () => Promise<T>): Promise<T> {
   const root = ensureSecureRoot(true)!;
   await securePrivateDirectory(root);
-  const file = join(root, "mutation.json");
-  const id = randomUUID();
-  for (let reclaimed = false; ; reclaimed = true) {
-    try {
-      writeFileSync(file, JSON.stringify({ id, pid: process.pid }), { flag: "wx", mode: 0o600 });
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const held = readStateJson<{ id?: string; pid?: number }>(file);
-      const info = lstatSync(file);
-      if (reclaimed || isProcessAlive(held?.pid) || !held?.pid && Date.now() - info.mtimeMs < LEASE_MS) {
-        throw new SelfUpdateError("update_in_progress", "Another update request is in progress", 409);
-      }
-      removeSecureFile(file);
+  const file = join(root, "mutation.sqlite");
+  secureRegularFile(file);
+  // Closing any extra fd to an existing SQLite file drops this process's POSIX locks.
+  try { closeSync(openSync(file, "wx", 0o600)); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  chmodSync(file, 0o600);
+  let database: Database | undefined;
+  let entered = false;
+  try {
+    database = new Database(file);
+    // Never block the event loop while another request awaits work under the gate.
+    database.exec("PRAGMA busy_timeout = 0");
+    database.exec("BEGIN IMMEDIATE");
+    entered = true;
+    return await run();
+  } catch (error) {
+    if (!entered && error && typeof error === "object" && "errno" in error && error.errno === 5) {
+      throw new SelfUpdateError("update_in_progress", "Another update request is in progress", 409);
     }
+    throw error;
+  } finally {
+    database?.close(true);
   }
-  try { return await run(); }
-  finally { if (readStateJson<{ id?: string }>(file)?.id === id) removeSecureFile(file); }
 }
 
 export async function prepareSelfUpdate(): Promise<PrepareResult> {
@@ -537,14 +543,24 @@ export async function resumeCoordinatedSelfUpdate(): Promise<void> {
     || !UUID.test(status.attemptId) || !isActiveLease(readStateJson(leasePath()))) return;
   const job = readStateJson<{ attemptId?: string }>(join(attemptsDir(false) ?? "", status.attemptId, "job.json"));
   if (job?.attemptId !== status.attemptId) return;
+  let ownsRecovery = false;
   try {
-    const plan = getUpgradePlan(status.attemptId);
-    if (!plan?.approved) throw new Error("The interrupted upgrade has no stored approval");
-    renewLease(status.attemptId);
-    const approval = { planId: plan.id, force: plan.approved.force };
-    await withUpdateMutation(() => startSelfUpdate(status.attemptId, approval, true));
+    await withUpdateMutation(async () => {
+      const live = readStateJson<StoredStatus>(statusPath());
+      const lease = readStateJson<{ attemptId?: string; expiresAt?: unknown }>(leasePath());
+      if (live?.attemptId !== status.attemptId || live.state !== "running" || live.workerPid !== undefined
+        || isProcessAlive(live.coordinatorPid) || lease?.attemptId !== status.attemptId || !isActiveLease(lease)) return;
+      const currentJob = readStateJson<{ attemptId?: string }>(join(attemptsDir(false) ?? "", live.attemptId, "job.json"));
+      if (currentJob?.attemptId !== live.attemptId) return;
+      ownsRecovery = true;
+      const plan = getUpgradePlan(live.attemptId);
+      if (!plan?.approved) throw new Error("The interrupted upgrade has no stored approval");
+      renewLease(live.attemptId);
+      await startSelfUpdate(live.attemptId, { planId: plan.id, force: plan.approved.force }, true);
+    });
   } catch (error) {
-    failAttempt(status.attemptId, error, "report");
+    if (ownsRecovery) failAttempt(status.attemptId, error, "report");
+    else if (!(error instanceof SelfUpdateError && error.code === "update_in_progress")) throw error;
   }
 }
 

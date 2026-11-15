@@ -116,14 +116,17 @@ interface PreparedRecovery {
 }
 
 /** Every precondition short of claiming the operation or touching the host: what the old host is, whether its installation is replaced or only restarted, and what supervises it. */
-async function prepare({ version, compatibility }: Pick<HostRecoveryInput, "version" | "compatibility">, deps: HostRecoveryDependencies, refresh: boolean): Promise<PreparedRecovery> {
+async function prepare({ version, compatibility, releasePin }: Pick<HostRecoveryInput, "version" | "compatibility" | "releasePin">, deps: HostRecoveryDependencies, refresh: boolean): Promise<PreparedRecovery> {
   // Never bypassed, force or not.
   if (isUpdateDisabled()) throw new HostRecoveryRefusal("blocked", "updates_disabled", "Updates are disabled by OMP_WEB_DISABLE_AUTOUPDATE", false, 403);
   let status: HostControlStatus;
   try { status = await deps.control("status"); }
   catch (error) { throw new HostRecoveryRefusal("failed", "no_host", `No host answers on this machine's private control endpoint: ${error instanceof Error ? error.message : String(error)}`); }
   if (!HOST_VERSION_PATTERN.test(status.version)) throw new HostRecoveryRefusal("failed", "invalid_host", "The running host reports an unreadable version");
-  if (status.version === version) throw new HostRecoveryRefusal("succeeded", "already_current", `This host already runs ${version}`);
+  if (status.version === version) {
+    if (releasePin) throw new HostRecoveryRefusal("blocked", "artifact_unverified", "An existing installation cannot be adopted as an approved release without artifact evidence");
+    throw new HostRecoveryRefusal("succeeded", "already_current", `This host already runs ${version}`);
+  }
   // A local maintenance drain is an operator's own window: waited out, never forced past.
   if (status.drained) throw new HostRecoveryRefusal("blocked", "host_drained", "This host is locally drained for maintenance");
   let install: OldHostInstall;

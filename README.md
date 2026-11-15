@@ -235,6 +235,10 @@ the server uses an isolated, fixed recovery bootstrap through their existing
 runner command channel. Windows uses native PowerShell and Windows process/service
 APIs; Linux and macOS use their own supervisor controls. A broken legacy runner or
 an uncontrollable service is reported, not treated as an updated host.
+For systemd, verified user units and elevated system-service control are supported.
+A non-root system service with custom polkit grants is refused when its exact
+stop/start authority cannot be proved without changing service state; use a user
+unit rather than relying on an unverifiable grant.
 
 Downloads and runner preflight happen before the relevant process stops. Progress
 survives web-server restarts; completion requires the expected release, approved

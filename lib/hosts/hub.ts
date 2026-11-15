@@ -945,7 +945,7 @@ function configCurrent(link: Link): boolean {
  * its own (its parts were deduped). */
 function applyUp(link: Link, message: UpMessage | UnknownMessage, whole?: UpMessage | UnknownMessage, joined = false): void {
   if (upgradeOnly(link) && message.type === "channels_changed") {
-    if (link.up.applied(message.seq)) link.recoveryInventory = message.channels;
+    if (joined || link.up.applied(message.seq)) link.recoveryInventory = message.channels;
     return;
   }
   const recoveryOutput = (message.type === "stdout" || message.type === "stderr" || message.type === "exit")

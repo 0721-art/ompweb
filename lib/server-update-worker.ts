@@ -327,13 +327,15 @@ export async function runServerUpdateWorker(descriptorPath: string, deps: Server
   };
 
   /** The host answers its private control endpoint as `version`, linked, from this installation (not just any daemon: a stale or other one never counts). */
-  const awaitHost = async (version: string, replaced: number | undefined): Promise<HostControlStatus> => {
+  const awaitHost = async (version: string, replaced: number | undefined, rollback = false): Promise<HostControlStatus> => {
     const deadline = Date.now() + deps.hostTimeoutMs;
     let last = "it did not answer";
     for (;;) {
       try {
         const status = await deps.hostControl("status");
-        const linked = status.linked && status.linkedServers?.some((url) => url.replace(/\/+$/, "") === d.serverUrl) === true;
+        const linked = status.linked && (status.linkedServers === undefined
+          ? rollback && version === d.fromVersion
+          : status.linkedServers.some((url) => url.replace(/\/+$/, "") === d.serverUrl));
         if (status.version === version && linked && status.pid !== replaced && hostInInstall(status, d.installDir)) return status;
         last = `it answered version ${status.version}${linked ? "" : ", not linked to this server"}${status.pid === replaced ? " from the process that was replaced" : ""}`;
       } catch (error) { last = message(error); }
@@ -383,7 +385,7 @@ export async function runServerUpdateWorker(descriptorPath: string, deps: Server
     if (flags.serverStopped && !blocked) await step(`The previous server ${d.fromVersion} could not be restarted`, () => startServer(d.fromVersion));
     if (flags.hostStopped && !blocked) await step("The previous local host could not be restarted", async () => {
       await deps.restart(hostProcess!, launchFor(d));
-      await awaitHost(d.fromVersion, hostProcess!.pid);
+      await awaitHost(d.fromVersion, hostProcess!.pid, true);
     });
     else if ((flags.hostDrained || flags.hostDrainPending) && !flags.hostStopped) await step("The local host's maintenance state could not be released", async () => {
       const status = await probeLocalHost(deps.hostControl);

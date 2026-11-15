@@ -696,17 +696,8 @@ export async function assertUpgradeProcessControl(plan: UpgradeProcess): Promise
         return;
       }
       if (process.geteuid?.() === 0) return;
-      const stat = readFileSync("/proc/self/stat", "utf8");
-      const start = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
-      const uid = process.getuid?.();
-      if (!/^\d+$/.test(start ?? "") || uid === undefined || process.geteuid?.() !== uid) fail("Cannot identify this process for systemd authorization");
-      for (const verb of ["stop", "start"]) {
-        try {
-          // systemd's manage-units policy uses unit/verb; pkcheck without interaction never prompts.
-          await exec("pkcheck", ["--action-id", "org.freedesktop.systemd1.manage-units", "--process", `${process.pid},${start},${uid}`, "--detail", "unit", sup.unit, "--detail", "verb", verb], { timeout: 10000 });
-        } catch (error) { fail(`Non-interactive ${verb} authorization for ${sup.unit} could not be established: ${messageOf(error)}`); }
-      }
-      return;
+      // Polkit requires a privileged checker for nonempty details; systemd exposes no read-only unit/verb authorization check.
+      fail(`Cannot verify non-root stop and start authorization for system unit ${sup.unit} without changing service state; use your own user unit or an elevated service to perform the update`);
     }
     case "launchd": {
       if (process.getuid?.() === undefined || process.getuid?.() !== process.geteuid?.() || sup.domain !== launchdDomain()) fail("Cannot prove control of another launchd domain");

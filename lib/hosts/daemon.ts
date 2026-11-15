@@ -508,6 +508,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
   function shutdown(code: number): Promise<void> {
     if (stopping) return stopping;
     stopped = true; watcher.close(); clearTimeout(reloadTimer); clearInterval(sweepTimer); clearInterval(capacityTimer); uploadRetention.stop();
+    clearTimeout(recoveryTimer);
     // Freeze before exit handlers observe children stopping.
     resume.freeze();
     // The configuration first: its requests to a server are aborted at once, so no start waiting on them holds the stop.
@@ -520,8 +521,18 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
   let interrupted: HostResumeEntry[] = [];
   try { interrupted = resume.takeRunning(); } catch (error) { log("could not recover interrupted sessions: " + reason(error)); }
   let recovering = false;
+  let recoveryTimer: NodeJS.Timeout | undefined;
   function recover(): Promise<void> | undefined {
     if (drained || stopped || recovering) return;
+    let operation: HostUpdateOperation | null = null;
+    try { operation = getHostUpdateOperation(); }
+    catch (error) { if (!updateStateWarningLogged) log("could not read host update status: " + reason(error)); updateStateWarningLogged = true; }
+    // Keep the claim until the worker finishes; recovery is not permission for concurrent user starts.
+    if (interrupted.length > 0 && hostUpdateBlocksNewWork(operation)) {
+      recoveryTimer ??= setTimeout(() => { recoveryTimer = undefined; recover(); }, 100);
+      recoveryTimer.unref?.();
+      return;
+    }
     recovering = true;
     operationsInFlight++;
     return channels.recover(interrupted).then(failed => resume.retireClaim(channels.running(), failed))

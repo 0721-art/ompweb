@@ -652,7 +652,13 @@ async function stopDaemon(plan: UpgradeProcess, pid: number, force: boolean, run
 /** A successful signal may outlast the stop wait. Never launch beside a live or replaced instance. */
 async function reconcilePendingStop(plan: UpgradeProcess, pid: number, runtime: WorkerRuntime): Promise<void> {
   for (const deadline = Date.now() + 30000; runtime.identity.isProcessAlive(pid); await pause(100)) {
-    if (plan.current.pid !== pid || await runtime.identity.processStartIdentity(pid) !== plan.current.identity) throw new Error("The signalled daemon's process identity could not be reconciled");
+    if (plan.current.pid !== pid) throw new Error("The signalled daemon's process identity could not be reconciled");
+    const identity = await runtime.identity.processStartIdentity(pid);
+    if (identity !== plan.current.identity) {
+      // On macOS ps can finish after the daemon exits; absence is not a recycled live pid.
+      if (!runtime.identity.isProcessAlive(pid)) return;
+      throw new Error(`The signalled daemon's process identity could not be reconciled (pid ${pid}, expected ${plan.current.identity}, observed ${identity ?? "unreadable"})`);
+    }
     if (Date.now() >= deadline) throw new Error("The signalled daemon is still stopping; no replacement was started");
   }
 }
