@@ -3415,6 +3415,79 @@ test("the notify host tool stays out of the Notifications tab, which lists only 
   assert.deepEqual(toastCalls, []);
 });
 
+test("viewed open_url calls honor server authorization and confirm through their pending result", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const decisions = [];
+  const opened = [];
+  const onOpenUrl = async (url, confirmationRequired) => {
+    decisions.push([url, confirmationRequired]);
+    if (confirmationRequired) return true;
+    if (url.includes("blocked")) return false;
+    opened.push(url);
+    return true;
+  };
+  const { es } = await startRun("s1", "q1", false, { onOpenUrl });
+
+  await act(async () => {
+    es.emit({
+      type: "host_tool_call",
+      id: "asked-url",
+      toolName: "open_url",
+      arguments: { url: "https://ask.test/path" },
+      openUrlAuthorization: "confirmation_required",
+    });
+    await sleep(30);
+  });
+  const authorize = callsTo("POST", "/api/agent/s1").find((call) => call.body?.type === "authorize_open_url" && call.body.id === "asked-url");
+  const asked = callsTo("POST", "/api/agent/s1").find((call) => call.body?.type === "host_tool_result" && call.body.id === "asked-url");
+  assert.ok(authorize, "confirmation ACK uses the existing session-command transport without settling the host tool");
+  assert.equal(asked?.body.isError, false);
+  assert.deepEqual(decisions.slice(0, 2), [
+    ["https://ask.test/path", true],
+    ["https://ask.test/path", false],
+  ]);
+  assert.deepEqual(opened, ["https://ask.test/path"], "the URL opens only after the confirmed result succeeds");
+
+  await act(async () => {
+    es.emit({
+      type: "host_tool_call",
+      id: "allowed-url",
+      toolName: "open_url",
+      arguments: { url: "https://allow.test/" },
+      openUrlAuthorization: "authorized",
+    });
+    await sleep(30);
+  });
+  const allowed = callsTo("POST", "/api/agent/s1").find((call) => call.body?.type === "host_tool_result" && call.body.id === "allowed-url");
+  assert.equal(callsTo("POST", "/api/agent/s1").some((call) => call.body?.type === "authorize_open_url" && call.body.id === "allowed-url"), false);
+  assert.equal(allowed?.body.isError, false);
+  assert.deepEqual(opened, ["https://ask.test/path", "https://allow.test/"]);
+
+  await act(async () => {
+    es.emit({
+      type: "host_tool_call",
+      id: "blocked-url",
+      toolName: "open_url",
+      arguments: { url: "https://blocked.test/" },
+      openUrlAuthorization: "confirmation_required",
+    });
+    await sleep(30);
+  });
+  assert.ok(callsTo("POST", "/api/agent/s1").some((call) => call.body?.type === "authorize_open_url" && call.body.id === "blocked-url"));
+  const blocked = callsTo("POST", "/api/agent/s1").find((call) => call.body?.type === "host_tool_result" && call.body.id === "blocked-url");
+  assert.equal(blocked?.body.isError, true, "opener failure is reported only after authorization");
+  assert.match(blocked?.body.result.content[0].text ?? "", /did not open/);
+
+  await act(async () => {
+    es.emit({ type: "host_tool_call", id: "legacy-url", toolName: "open_url", arguments: { url: "https://legacy.test/" } });
+    await sleep(30);
+  });
+  const legacy = callsTo("POST", "/api/agent/s1").find((call) => call.body?.id === "legacy-url");
+  assert.equal(legacy?.body.isError, true);
+  assert.equal(opened.includes("https://legacy.test/"), false, "legacy local auto-open authority is ignored");
+});
+
 test("an open_file local:// call asks the server for the calling session's file and opens the absolute path it names", async () => {
   resetWorld();
   primeSession("s1", [userMsg("u0", "q")]);

@@ -532,6 +532,7 @@ export interface CrossSessionHostToolCall {
     agentId?: string;
     modelRole?: string;
   };
+  openUrlAuthorization?: "authorized" | "confirmation_required";
 }
 
 export type CrossSessionHostToolEvent = (CrossSessionHostToolCall & { type?: "host_tool_call" }) | {

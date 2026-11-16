@@ -21,7 +21,7 @@ import {
   type AgentToolSessionOps,
 } from "./agent-tools";
 import type { AgentToolHost } from "./agent-tool-hosts";
-import { validateToolCaller } from "./tool-policy-runtime";
+import { confirmToolCapability, resolveDeferredToolAuthorization, revokeConfirmedToolCapability, validateToolCaller, type DeferredToolAuthorization, type ToolCaller } from "./tool-policy-runtime";
 import type { CapabilityId } from "./tool-access-policy";
 import { createGithubToolOps, GITHUB_REPLAY_SAFE_TOOLS, GITHUB_TOOL_NAMES } from "./github/tools";
 import { markShuttingDown, recordRunningSessions, resumeOnHostLink, takeInterruptedSessions, type InterruptibleSession } from "./session-resume";
@@ -140,6 +140,19 @@ const AGENT_TOOL_UNKNOWN_OUTCOME = "omp-web restarted while this ran; the outcom
 const GITHUB_UNKNOWN_OUTCOME = "omp-web restarted while this ran; the outcome is unknown. Inspect workflow runs with github_run_list or github_read; inspect comments or threads with github_read for other writes. Do not automatically repeat a dispatch or rerun.";
 /** A GitHub write is checked on GitHub, not in the session list. */
 const unknownOutcome = (toolName: unknown) => (typeof toolName === "string" && GITHUB_TOOL_NAMES.has(toolName) ? GITHUB_UNKNOWN_OUTCOME : AGENT_TOOL_UNKNOWN_OUTCOME);
+
+function openUrlOrigin(event: UnsequencedAgentEvent): string {
+  const args = isRecord(event.arguments) ? event.arguments : {};
+  if (typeof args.url !== "string") throw new Error("A browser URL is required.");
+  let url: URL;
+  try {
+    url = new URL(args.url);
+  } catch {
+    throw new Error("The browser URL is invalid.");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Only http(s) browser URLs may be opened.");
+  return url.origin;
+}
 
 /**
  * Failure raised by omp-web itself (not by omp) carrying a stable snake_case
@@ -519,7 +532,17 @@ export class AgentSessionWrapper {
   private hostToolsUnknown = false;
   private _adopted = false;
   /** host_tool_call ids awaiting a host_tool_result from the browser. */
-  private pendingHostTools = new Map<string, { event: UnsequencedAgentEvent; crossSessionId?: string }>();
+  private pendingHostTools = new Map<string, {
+    event: UnsequencedAgentEvent;
+    crossSessionId?: string;
+    openUrl?: {
+      origin: string;
+      caller?: ToolCaller;
+      authorization: DeferredToolAuthorization;
+      confirmed?: boolean;
+      grantSessionId?: string;
+    };
+  }>();
   /** Server-side agent tool calls in flight (answerServerAgentTool); host_tool_cancel aborts them. */
   private serverToolCalls = new Map<string, AbortController>();
   /** Own host calls no tab has seen yet (see parkHostTool), with their deadlines. */
@@ -1386,18 +1409,39 @@ export class AgentSessionWrapper {
         // reject immediately so the agent never hangs on a tool nobody will
         // answer.
         if (id && toolName && (this.hostToolNames.has(toolName) || this.hostToolsUnknown)) {
+          let routedEvent = event;
+          let openUrl: { origin: string; caller?: ToolCaller; authorization: DeferredToolAuthorization } | undefined;
+          if (toolName === "open_url") {
+            try {
+              const origin = openUrlOrigin(event);
+              const caller = validateToolCaller(event.caller);
+              const authorization = resolveDeferredToolAuthorization({
+                capability: "browser.open_url",
+                sessionId: () => this.sessionId,
+                capabilityLabel: "open browser URLs",
+                resourceType: "url.origin",
+                resourceKey: origin,
+                caller,
+              });
+              openUrl = { origin, caller, authorization };
+              routedEvent = { ...event, openUrlAuthorization: authorization };
+            } catch (error) {
+              this.rejectBrowserOpenUrl(event, error);
+              return;
+            }
+          }
           const ownTab = this.hasBrowserSubscribers();
           if (ownTab) {
-            this.pendingHostTools.set(id, { event });
-            this.emit(event);
+            this.pendingHostTools.set(id, { event: routedEvent, openUrl });
+            this.emit(routedEvent);
             notifyRunningChange();
             return;
           }
           const otherTabs = getHostToolListeners();
           if (otherTabs.size > 0) {
-            this.pendingHostTools.set(id, { event, crossSessionId: this.sessionId });
-            const args = event.arguments && typeof event.arguments === "object" ? event.arguments as Record<string, unknown> : {};
-            const caller = validateToolCaller(event.caller);
+            this.pendingHostTools.set(id, { event: routedEvent, crossSessionId: this.sessionId, openUrl });
+            const args = routedEvent.arguments && typeof routedEvent.arguments === "object" ? routedEvent.arguments as Record<string, unknown> : {};
+            const caller = validateToolCaller(routedEvent.caller);
             const call: CrossSessionHostToolCall = {
               sessionId: this.sessionId,
               hostId: this.host.id,
@@ -1406,6 +1450,7 @@ export class AgentSessionWrapper {
               toolName,
               arguments: args,
               ...(caller ? { caller } : {}),
+              ...(openUrl ? { openUrlAuthorization: openUrl.authorization } : {}),
             };
             for (const listener of otherTabs) {
               try { listener(call); } catch { /* ignore listener errors */ }
@@ -1415,7 +1460,7 @@ export class AgentSessionWrapper {
           }
           // Adopted with every tab gone with the old server: the next tab to attach answers it.
           if (this.hostToolsUnknown) {
-            this.parkHostTool(id, event);
+            this.parkHostTool(id, routedEvent, openUrl);
             notifyRunningChange();
             return;
           }
@@ -1609,10 +1654,40 @@ export class AgentSessionWrapper {
     this.emit({ type: "notice", level: "warning", message: `Rejected unavailable host tool: ${toolName}` });
   }
 
+  private rejectBrowserOpenUrl(event: UnsequencedAgentEvent, error: unknown): void {
+    const id = typeof event.id === "string" ? event.id : "";
+    if (!id) return;
+    const message = error instanceof Error ? error.message : "The browser URL was not authorized.";
+    this.proc.sendFrame({
+      type: "host_tool_result",
+      id,
+      isError: true,
+      result: { content: [{ type: "text", text: message }] },
+    });
+  }
+
+  private revokePendingOpenUrlGrant(
+    id: string,
+    pending: { openUrl?: { origin: string; caller?: ToolCaller; grantSessionId?: string } },
+  ): void {
+    const openUrl = pending.openUrl;
+    if (!openUrl?.grantSessionId) return;
+    revokeConfirmedToolCapability({
+      capability: "browser.open_url",
+      sessionId: () => this.sessionId,
+      capabilityLabel: "open browser URLs",
+      resourceType: "url.origin",
+      resourceKey: openUrl.origin,
+      caller: openUrl.caller,
+    }, openUrl.grantSessionId, () => this.pendingHostTools.get(id) === pending);
+    delete openUrl.grantSessionId;
+  }
+
   /** Withdraw the browser operation using the identity under which it was delivered. */
   private cancelPendingHostTool(id: string): boolean {
     const pending = this.pendingHostTools.get(id);
     if (!pending) return false;
+    this.revokePendingOpenUrlGrant(id, pending);
     this.pendingHostTools.delete(id);
     this.unparkHostTool(id);
     const event = { type: "host_tool_cancel", targetId: id };
@@ -1650,8 +1725,12 @@ export class AgentSessionWrapper {
    * the old server) for the next tab to attach (see onEvent). If none attaches
    * within the disconnect window it is settled, so the agent never waits forever.
    */
-  private parkHostTool(id: string, event: UnsequencedAgentEvent): void {
-    this.pendingHostTools.set(id, { event });
+  private parkHostTool(
+    id: string,
+    event: UnsequencedAgentEvent,
+    openUrl?: { origin: string; caller?: ToolCaller; authorization: DeferredToolAuthorization },
+  ): void {
+    this.pendingHostTools.set(id, { event, openUrl });
     const timer = setTimeout(() => {
       this.parkedHostTools.delete(id);
       if (!this.pendingHostTools.delete(id)) return;
@@ -2964,10 +3043,47 @@ export class AgentSessionWrapper {
         return null;
       }
 
+      case "authorize_open_url": {
+        const id = typeof command.id === "string" ? command.id : "";
+        const pending = id ? this.pendingHostTools.get(id) : undefined;
+        if (!pending?.openUrl || pending.openUrl.authorization !== "confirmation_required" || pending.openUrl.confirmed) {
+          throw new Error("No matching pending browser URL confirmation.");
+        }
+        try {
+          const approval = confirmToolCapability({
+            capability: "browser.open_url",
+            sessionId: () => this.sessionId,
+            capabilityLabel: "open browser URLs",
+            resourceType: "url.origin",
+            resourceKey: pending.openUrl.origin,
+            caller: pending.openUrl.caller,
+          }, () => this.pendingHostTools.get(id) === pending);
+          pending.openUrl.confirmed = true;
+          if (approval.granted) pending.openUrl.grantSessionId = approval.sessionId;
+          return null;
+        } catch (error) {
+          this.pendingHostTools.delete(id);
+          this.unparkHostTool(id);
+          this.rejectBrowserOpenUrl(pending.event, error);
+          throw error;
+        }
+      }
+
       case "host_tool_result": {
-        if (typeof command.id === "string") {
-          this.pendingHostTools.delete(command.id);
-          this.unparkHostTool(command.id);
+        const id = typeof command.id === "string" ? command.id : "";
+        const pending = id ? this.pendingHostTools.get(id) : undefined;
+        if (pending?.openUrl?.authorization === "confirmation_required"
+          && command.isError !== true && !pending.openUrl.confirmed) {
+          this.pendingHostTools.delete(id);
+          this.unparkHostTool(id);
+          const error = new Error("The browser URL was not authorized through its pending confirmation.");
+          this.rejectBrowserOpenUrl(pending.event, error);
+          throw error;
+        }
+        if (pending?.openUrl && command.isError === true) this.revokePendingOpenUrlGrant(id, pending);
+        if (id) {
+          this.pendingHostTools.delete(id);
+          this.unparkHostTool(id);
         }
         this.proc.sendFrame(command as { type: string; [key: string]: unknown });
         return null;

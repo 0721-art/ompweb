@@ -88,8 +88,8 @@ interface Props {
   onSessionStatsPanelOpen?: () => void;
   onProviderUsageContextChange?: (context: ProviderUsageContext | null) => void;
   onOpenFile?: (filePath: string, name: string, source: WorkspaceFileSource) => void;
-  /** Handles the open_url host tool; returns the result text for the agent. */
-  onOpenUrl?: (url: string) => string;
+  /** Confirms or opens an open_url request according to server authorization. */
+  onOpenUrl?: (url: string, confirmationRequired: boolean, signal?: AbortSignal) => boolean | Promise<boolean>;
   onGenerationSpeedChange?: (speed: GenerationSpeedInfo | null) => void;
   /** Open Settings → API Keys & Providers (from the model picker). */
   onOpenProviders?: () => void;

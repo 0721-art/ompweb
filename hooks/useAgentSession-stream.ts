@@ -319,8 +319,11 @@ export function isSafeOpenUrl(raw: unknown): boolean {
 }
 
 export interface HostToolHandlers {
-  /** Open a validated URL; returns the result text reported to the agent. */
-  openUrl: (url: string) => string;
+  /**
+   * For confirmationRequired, resolve whether the user confirmed without opening.
+   * Otherwise perform the actual browser open and report whether it succeeded.
+   */
+  openUrl: (url: string, confirmationRequired: boolean, signal?: AbortSignal) => boolean | Promise<boolean>;
   /** Open a file tab; may return the result text reported to the agent. `ownerSessionId` is set when the server
    * resolved a `local://` file for a session under another id (an alias): the tab belongs to that owner. */
   openFile?: (path: string, name: string, ownerSessionId?: string) => string | void;
@@ -368,7 +371,8 @@ export async function runHostTool(
   handlers: HostToolHandlers,
   sessionId: string | undefined,
   signal?: AbortSignal,
-): Promise<{ text: string; isError: boolean }> {
+  openUrlAuthorization?: unknown,
+): Promise<{ text: string; isError: boolean; openUrl?: string; authorizeOpenUrl?: true }> {
   const str = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
   const canceled = { text: "Host tool request canceled", isError: true };
   if (signal?.aborted) return canceled;
@@ -376,7 +380,20 @@ export async function runHostTool(
     case "open_url": {
       const raw = str(args.url) ?? "";
       if (!isSafeOpenUrl(raw)) return { text: "Unsafe or invalid URL not opened", isError: !!raw };
-      return { text: handlers.openUrl(raw), isError: false };
+      if (openUrlAuthorization !== "authorized" && openUrlAuthorization !== "confirmation_required") {
+        return { text: "Browser URL authorization was not supplied by the server", isError: true };
+      }
+      const confirmationRequired = openUrlAuthorization === "confirmation_required";
+      if (confirmationRequired && !(await handlers.openUrl(raw, true, signal))) {
+        return { text: `The user declined to open ${raw}`, isError: true };
+      }
+      if (signal?.aborted) return canceled;
+      return {
+        text: `Ready to open ${raw}`,
+        isError: false,
+        openUrl: raw,
+        ...(confirmationRequired ? { authorizeOpenUrl: true as const } : {}),
+      };
     }
     case "notify": {
       const title = str(args.title) ?? "OMP";

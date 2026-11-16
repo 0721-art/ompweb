@@ -251,8 +251,8 @@ export interface UseAgentSessionOptions {
   setToolPreset?: (preset: "none" | "default" | "full") => void;
   /** Opens a file in the web UI's file viewer (used by the open_file host tool). */
   onOpenFile?: (filePath: string, name: string, source: WorkspaceFileSource) => void;
-  /** Handles the open_url host tool (may ask the user first); returns the result text. */
-  onOpenUrl?: (url: string) => string;
+  /** Confirms or opens an open_url request according to the server-owned authorization field. */
+  onOpenUrl?: (url: string, confirmationRequired: boolean, signal?: AbortSignal) => boolean | Promise<boolean>;
 }
 
 /** Correlation distinguishes identical submitted intents; legacy echoes still dedupe by native timestamp and text. */
@@ -1848,7 +1848,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   };
 
   /** Answer a host_tool_call with a toolResult payload. */
-  const respondHostTool = useCallback(async (sid: string, id: string, text: string, isError = false) => {
+  const respondHostTool = useCallback(async (sid: string, id: string, text: string, isError = false): Promise<boolean> => {
     try {
       await sendAgentCommand(sid, {
         type: "host_tool_result",
@@ -1856,30 +1856,52 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         isError,
         result: { content: [{ type: "text", text }] },
       });
+      return true;
     } catch (e) {
       console.error("Failed to send host tool result:", e);
+      return false;
     }
   }, []);
 
-  const handleHostToolCall = useCallback(async (id: string, toolName: string, args: Record<string, unknown>) => {
+  const handleHostToolCall = useCallback(async (id: string, toolName: string, args: Record<string, unknown>, openUrlAuthorization?: unknown) => {
     const sid = sessionIdRef.current;
     if (!sid || pendingHostToolControllersRef.current.has(id)) return;
     const controller = new AbortController();
     pendingHostToolControllersRef.current.set(id, controller);
+    const openUrl = onOpenUrl ?? ((url: string, confirmationRequired: boolean) => {
+      if (confirmationRequired) return false;
+      const opened = window.open(url, "_blank", "noopener,noreferrer");
+      opened?.focus?.();
+      return opened !== null;
+    });
     try {
-      const { text, isError } = await runHostTool(toolName, args, {
-        openUrl: onOpenUrl ?? ((url) => {
-          window.open(url, "_blank", "noopener,noreferrer")?.focus?.();
-          return `Opened ${url}`;
-        }),
+      const result = await runHostTool(toolName, args, {
+        openUrl,
         openFile: onOpenFile ? (path, name, owner) => {
           if (!hookAliveRef.current) throw new Error("File not opened: the requesting chat is no longer active");
           onOpenFile(path, name, {
             sessionId: owner ?? sid, hostId: createdOwnerRef.current?.hostId ?? session?.hostId ?? newSessionHostId ?? "local", cwd: createdOwnerRef.current?.cwd ?? session?.cwd ?? newSessionCwd,
           });
         } : undefined,
-      }, sid, controller.signal);
-      if (!controller.signal.aborted) await respondHostTool(sid, id, text, isError);
+      }, sid, controller.signal, openUrlAuthorization);
+      if (controller.signal.aborted) return;
+      if (result.openUrl) {
+        if (result.authorizeOpenUrl) {
+          await sendAgentCommand(sid, { type: "authorize_open_url", id });
+          if (controller.signal.aborted) return;
+        }
+        let opened = false;
+        try {
+          opened = await openUrl(result.openUrl, false, controller.signal);
+        } catch {
+          opened = false;
+        }
+        if (!controller.signal.aborted) {
+          await respondHostTool(sid, id, opened ? `Opened ${result.openUrl}` : `The browser did not open ${result.openUrl}`, !opened);
+        }
+      } else {
+        await respondHostTool(sid, id, result.text, result.isError);
+      }
     } finally {
       pendingHostToolControllersRef.current.delete(id);
     }
@@ -3045,7 +3067,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         const id = typeof event.id === "string" ? event.id : "";
         const toolName = typeof event.toolName === "string" ? event.toolName : "";
         const args = isRecord(event.arguments) ? event.arguments : {};
-        if (id && toolName) void handleHostToolCall(id, toolName, args);
+        if (id && toolName) void handleHostToolCall(id, toolName, args, event.openUrlAuthorization);
         break;
       }
       case "host_tool_cancel": {

@@ -116,3 +116,21 @@ Task 4D verification:
 - `bun test --timeout 30000 lib/rpc-manager.test.mjs` — 159 pass, 0 fail.
 - `npm run typecheck` — pass.
 - `npx eslint lib/rpc-manager.ts lib/rpc-manager.test.mjs` — pass.
+
+## Task 4B: server-owned browser URL authorization
+
+- Added a two-phase handshake on the existing session-command transport. The server validates an `http(s)` URL and canonical origin, resolves `browser.open_url` against authoritative caller/current-session policy, and routes only `openUrlAuthorization: "authorized" | "confirmation_required"` on the existing pending host-tool event.
+- Confirmation-required browser flows keep the existing dialog and exact pending host-tool ID. `authorize_open_url { id }` rechecks the pending identity, cancellation, current legal session identity, and current policy under the tool-policy lock, records the session/origin grant, and ACKs without settling the native callback. The browser opens only after that ACK, then reports actual opener success/error through the original `host_tool_result`.
+- Unknown, forged, cancelled, withdrawn, late, disabled, malformed, and policy-revoked requests fail closed. Opener failure or withdrawal after authorization removes the provisional grant. Session moves grant only the current legal identity, and distinct origins remain independent.
+- Applied the same protocol to viewed and cross-session callbacks. Removed the old browser-local automatic-open control and storage authority. `open_file` retains its existing execution and confirmation behavior. No endpoint, POST route, or parallel policy path was added.
+
+Task 4B verification:
+
+- RED: `bun test --timeout 30000 lib/rpc-manager.test.mjs --test-name-pattern 'open_url authorization|open_url confirmation'` — 0 pass, 2 fail (unsafe URL reached browser; cancelled result ID was accepted).
+- RED: `bun test --timeout 30000 hooks/useAgentSession.rpc.test.mjs --test-name-pattern 'viewed open_url'` — failed because the pending result carried no server confirmation handshake.
+- `bun test --timeout 30000 lib/rpc-manager.test.mjs` — 161 pass, 0 fail.
+- `bun test --timeout 30000 hooks/useAgentSession.rpc.test.mjs hooks/useAgentSession-stream.local-file.test.mjs` — 331 pass, 0 fail.
+- `bun test --timeout 30000 lib/tool-policy-runtime.test.mjs lib/tool-approval-store.test.mjs` — 17 pass, 0 fail.
+- `bun test --timeout 30000 lib/event-stream-protocol.test.mjs lib/browser-link.test.mjs lib/agent-client.test.mjs` — 53 pass, 0 fail.
+- `npm run typecheck` — pass.
+- Scoped ESLint over changed implementation/tests — 0 errors; 5 pre-existing `react-hooks/exhaustive-deps` warnings in `components/AppShell.tsx`.
