@@ -14,6 +14,7 @@ export interface ToolApprovalGrant {
 
 declare global {
   var __ompToolApprovalStore: { path: string; db: Database } | undefined;
+  var __ompToolApprovalMigrationBeforeCommit: (() => void) | undefined;
 }
 
 const MAX_SESSION_ID_LENGTH = 256;
@@ -44,6 +45,7 @@ export function isToolApprovalGrant(value: unknown): value is ToolApprovalGrant 
     && !Object.hasOwn(RESERVED_KEYS, value.resourceType)
     && validText(value.resourceKey, MAX_RESOURCE_KEY_LENGTH)
     && typeof value.capability === "string"
+    && value.capability !== "omp.bash"
     && CAPABILITY_IDS.includes(value.capability as CapabilityId);
 }
 
@@ -89,8 +91,12 @@ function migrateLegacyGithubGrants(database: Database): void {
   } finally {
     legacy.close(true);
   }
+  globalThis.__ompToolApprovalMigrationBeforeCommit?.();
 
   transaction(database, () => {
+    // Another process may have completed migration and a user may have revoked
+    // its grant after our optimistic read. Never let this stale importer restore it.
+    if (database.prepare("SELECT 1 FROM migrations WHERE name = ?").get(LEGACY_MIGRATION)) return;
     const insert = database.prepare("INSERT OR IGNORE INTO grants (session_id, resource_type, resource_key, capability) VALUES (?, 'github.repository', ?, 'github.read_watch')");
     for (const row of rows) {
       if (isToolApprovalGrant({ sessionId: row.session_id, resourceType: "github.repository", resourceKey: row.repo_key, capability: "github.read_watch" })) {

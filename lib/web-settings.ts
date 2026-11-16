@@ -311,6 +311,7 @@ function capabilitiesRequiringRevocation(current: ToolPolicies, next: ToolPolici
   const changed = (capability: CapabilityId, before: OperationPolicy | undefined, after: OperationPolicy | undefined) => {
     if (before?.enabled === after?.enabled && before?.confirmation === after?.confirmation) return;
     if (after?.enabled === false
+      || (before?.enabled === true && after === undefined)
       || (before === undefined && after?.enabled === true && after.confirmation === "ask")
       || (before?.enabled === true && before.confirmation === "allow" && (after?.enabled !== true || after.confirmation !== "allow"))) {
       revoked.add(capability);
