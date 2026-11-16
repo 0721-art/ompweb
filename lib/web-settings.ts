@@ -10,6 +10,8 @@ export type GithubActionsOperation = "dispatch" | "cancel" | "rerun";
 export type GithubActionsPermission = "deny" | "ask" | "allow";
 export type GithubActionsPermissions = Record<GithubActionsOperation, GithubActionsPermission>;
 
+export type AgentMessagePermission = "alwaysAsk" | "trustCluster";
+
 /** omp-web's own server-side settings (omp's config.yml stays omp's). */
 export interface WebServerSettings {
   /** Resume sessions that were mid-run when omp-web stopped. */
@@ -22,6 +24,8 @@ export interface WebServerSettings {
    * or SSE reconnect).
    */
   agentToolsEnabled: boolean;
+  /** Approval policy for send_to_session calls. */
+  agentMessagePermission: AgentMessagePermission;
   /** The GitHub agent tools may post and resolve threads as the server's `gh` account without asking the user each time. */
   githubWritesUnasked: boolean;
   /** Per-operation approval policy for GitHub Actions mutations. */
@@ -41,6 +45,7 @@ export interface WebServerSettings {
 const DEFAULTS: WebServerSettings = {
   autoResumeSessions: false,
   agentToolsEnabled: false,
+  agentMessagePermission: "alwaysAsk",
   githubWritesUnasked: false,
   githubActionsPermissions: { dispatch: "ask", cancel: "ask", rerun: "ask" },
   agentEnv: {},
@@ -94,6 +99,7 @@ function normalizeSettings(raw: Record<string, unknown>): WebServerSettings {
   return {
     autoResumeSessions: raw.autoResumeSessions === true,
     agentToolsEnabled: raw.agentToolsEnabled === true,
+    agentMessagePermission: raw.agentMessagePermission === "trustCluster" ? "trustCluster" : "alwaysAsk",
     githubWritesUnasked: raw.githubWritesUnasked === true,
     githubActionsPermissions: readGithubActionsPermissions(raw.githubActionsPermissions),
     agentEnv: readAgentEnvRecord(raw.agentEnv),
