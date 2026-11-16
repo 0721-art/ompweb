@@ -3433,7 +3433,7 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
 
     async createSession(input, authorize) {
       const throwIfCancelled = () => {
-        if (source.signal?.aborted) throw new Error("The agent tool call was cancelled before a session was started.");
+        if (source.signal?.aborted) throw new HostOpError(499, "agent_tool_cancelled", "The agent tool call was cancelled before a session was started.");
       };
       const authorizeHost = async (host: Host) => {
         throwIfCancelled();
