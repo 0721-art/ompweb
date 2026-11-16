@@ -1998,7 +1998,7 @@ export class AgentSessionWrapper {
         sourceCwd: this.cwd,
         sourceHostId: this.host.id,
         enabled: settings.agentToolsEnabled,
-        messagePermission: readAgentMessagePermissionFromDisk(),
+        messagePermission: await readAgentMessagePermissionFromDisk(),
         clusterHostIds,
         guard: getAgentToolGuard(),
         confirm: (title) => this.confirmFromServer(title, cancel.signal),

@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
+import { readFile } from "node:fs/promises";
 import { resolve } from "path";
 import { getAgentDir } from "./omp/paths";
 import { BROWSER_TRANSPORTS, type BrowserTransport, type BrowserTransportState } from "./event-stream-protocol";
@@ -156,8 +157,12 @@ export function readAgentToolsEnabledFromDisk(): boolean {
   return freshSettingsRecord()?.agentToolsEnabled === true;
 }
 
-export function readAgentMessagePermissionFromDisk(): AgentMessagePermission {
-  return freshSettingsRecord()?.agentMessagePermission === "trustCluster" ? "trustCluster" : "alwaysAsk";
+export async function readAgentMessagePermissionFromDisk(): Promise<AgentMessagePermission> {
+  try {
+    return parseSettingsRecord(await readFile(settingsPath(), "utf8")).agentMessagePermission === "trustCluster" ? "trustCluster" : "alwaysAsk";
+  } catch {
+    return "alwaysAsk";
+  }
 }
 
 export function readGithubWritesUnaskedFromDisk(): boolean {
