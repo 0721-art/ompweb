@@ -9,7 +9,7 @@ import { RpcCommandError, RpcCommandTimeoutError, RpcProcess, type RpcFrame } fr
 import type { RpcTransport } from "./omp/rpc-transport";
 import { cacheSessionPath } from "./session-reader";
 import { allowFileRoot } from "./file-access";
-import { loadWebServerSettings } from "./web-settings";
+import { loadWebServerSettings, readAgentMessagePermissionFromDisk } from "./web-settings";
 import {
   AGENT_TOOL_DEFINITIONS,
   AGENT_TOOL_NAMES,
@@ -1998,7 +1998,7 @@ export class AgentSessionWrapper {
         sourceCwd: this.cwd,
         sourceHostId: this.host.id,
         enabled: settings.agentToolsEnabled,
-        messagePermission: settings.agentMessagePermission,
+        messagePermission: readAgentMessagePermissionFromDisk(),
         clusterHostIds,
         guard: getAgentToolGuard(),
         confirm: (title) => this.confirmFromServer(title, cancel.signal),

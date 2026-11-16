@@ -156,6 +156,10 @@ export function readAgentToolsEnabledFromDisk(): boolean {
   return freshSettingsRecord()?.agentToolsEnabled === true;
 }
 
+export function readAgentMessagePermissionFromDisk(): AgentMessagePermission {
+  return freshSettingsRecord()?.agentMessagePermission === "trustCluster" ? "trustCluster" : "alwaysAsk";
+}
+
 export function readGithubWritesUnaskedFromDisk(): boolean {
   return freshSettingsRecord()?.githubWritesUnasked === true;
 }
