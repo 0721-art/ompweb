@@ -126,7 +126,7 @@ const AWAITING_AGENT_START_TIMEOUT_MS = 10_000;
 const RESTARTING_MESSAGE = "This session is restarting — retry in a moment.";
 /** Answer to a replayed server agent tool call that changes things: it may have run before the restart. */
 const AGENT_TOOL_UNKNOWN_OUTCOME = "omp-web restarted while this ran; the outcome is unknown, check with list_sessions before retrying";
-const GITHUB_UNKNOWN_OUTCOME = "omp-web restarted while this ran; the outcome is unknown, check with github_read (include comments or threads) before retrying";
+const GITHUB_UNKNOWN_OUTCOME = "omp-web restarted while this ran; the outcome is unknown. Inspect workflow runs with github_run_list or github_read; inspect comments or threads with github_read for other writes. Do not automatically repeat a dispatch or rerun.";
 /** A GitHub write is checked on GitHub, not in the session list. */
 const unknownOutcome = (toolName: unknown) => (typeof toolName === "string" && GITHUB_TOOL_NAMES.has(toolName) ? GITHUB_UNKNOWN_OUTCOME : AGENT_TOOL_UNKNOWN_OUTCOME);
 

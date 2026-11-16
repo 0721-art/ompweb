@@ -243,7 +243,7 @@ async function pollItem(state: WatcherState, itemKey: string): Promise<void> {
       const update: PendingUpdate = {
         entryId: updateEntryId(`${watch.sessionId}\0${itemKey}\0${watch.registrationId}\0update`, events),
         cursor,
-        final: events.some((e) => e.kind === "merged" || e.kind === "closed"),
+        final: cursor.final,
         batches,
         batchIndex: 0,
       };

@@ -22,6 +22,11 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 - **Unknown legacy host activity never grants Force permission.** A shared local daemon can be interrupted only when the approved plan explicitly authorizes Force; otherwise newly busy hosts refuse cutover.
 - **Windows update status publication tolerates brief file-sharing conflicts.** Atomic replacement retries sharing-related errors for at most one second without deleting the prior state. Persistent failures still stop the update and report the error.
 - **Local-host startup ignores unrelated services.** Installation paths match at directory boundaries, and daemon detection distinguishes the host subcommand from directory names or server argument values.
+- **Open live subagent transcripts without waiting forever.** Transcript pages now read the subagent's on-disk artifact directly instead of waiting for its busy agent process to answer first.
+
+### Added
+
+- **Race-free GitHub watch registration.** `watch_github` returns the metadata snapshot used as a new watch's baseline, so agents can inspect existing comments, reviews, threads and CI before relying on later watch updates.
 
 ## [v0.7.1] - 2026-11-14
 
