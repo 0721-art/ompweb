@@ -642,14 +642,14 @@ export class AgentSessionWrapper {
     return this.isAlive() && !this.restarting && !this.handshaking && !this.unsettled && !this.messageBoundaryBusy();
   }
 
-  async replaceAdvisorIfIdle(launch: SpawnRequest, preparing: boolean): Promise<SpawnResult | null> {
+  async replaceAdvisorIfIdle(launch: SpawnRequest, preparing: boolean, authorize?: () => Promise<unknown>): Promise<SpawnResult | null> {
     if (!this.hostOwnedLifecycle || !this.canReplaceAdvisor()) return null;
     const old = this.proc;
     this.restarting = true;
     this.restartingProc = old;
     this.expectedExitProc = old;
     try {
-      const spawned = await this.host.spawnRpc(launch, this._sessionId, { replaceAdvisor: true, preparing });
+      const spawned = await this.host.spawnRpc(launch, this._sessionId, { replaceAdvisor: true, preparing, ...(authorize ? { authorize } : {}) });
       if (spawned.transport === old.transport) return null; // A peer became busy before the daemon's atomic check.
       await this.destroyAndWait("advisor");
       return spawned;
@@ -3506,7 +3506,7 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
         if (!host || !target) throw new Error(`Session not found: ${input.sessionId}`);
         // The open's preparation lease keeps an idle shared child (and its advisor mode) until the message is sent.
         await input.authorize();
-        const started = await startRpcSession(input.sessionId, target.sessionFile, target.cwd, undefined, undefined, target.recordedCwd, undefined, host, true);
+        const started = await startRpcSession(input.sessionId, target.sessionFile, target.cwd, undefined, undefined, target.recordedCwd, undefined, host, true, undefined, input.authorize);
         wrapper = started.session;
         cold = true;
       }
@@ -3605,7 +3605,7 @@ export async function startNewRpcSession(
     return { ok: false, status: 409, code: "prepared_cwd_changed", error: "The prepared worktree is no longer available" };
   }
   const tempKey = `__new__${creationId ?? randomUUID()}`;
-  const started = await startRpcSession(tempKey, "", spawnCwd, toolNames, advisor, undefined, undefined, host, preparingCommand, creationId);
+  const started = await startRpcSession(tempKey, "", spawnCwd, toolNames, advisor, undefined, undefined, host, preparingCommand, creationId, authorize);
   // Without this a file request under a brand-new cwd would 403 for up to the allowed-roots cache TTL.
   // Never for another host: its paths do not exist on this machine.
   if (host.id === LOCAL_HOST_ID) allowFileRoot(spawnCwd);
@@ -3638,6 +3638,7 @@ export async function startRpcSession(
   preparingCommand = false,
   /** Stable independent creation; never set for ordinary standalone starts or resumes. */
   creationId?: string,
+  authorize?: () => Promise<unknown>,
 ): Promise<{ session: AgentSessionWrapper; realSessionId: string }> {
   const registry = getRegistry();
   const locks = getLocks();
@@ -3672,7 +3673,7 @@ export async function startRpcSession(
       return { session: existing, realSessionId: existing.sessionId };
     }
     if (existing.hostOwnedLifecycle) {
-      replacement = await existing.replaceAdvisorIfIdle(launch, preparingCommand) ?? undefined;
+      replacement = await existing.replaceAdvisorIfIdle(launch, preparingCommand, authorize) ?? undefined;
       if (!replacement) return { session: existing, realSessionId: sessionId };
     } else {
       await existing.destroyAndWait("advisor", true);
@@ -3703,7 +3704,7 @@ export async function startRpcSession(
     // The wrapper needs the process and the process's onExit needs the wrapper;
     // the holder breaks that cycle (onExit only fires once the child dies).
     const holder: { wrapper?: AgentSessionWrapper } = {};
-    const spawned = replacement ?? await host.spawnRpc(launch, sessionFile ? sessionId : null, { replaceAdvisor: advisor !== undefined, preparing: preparingCommand });
+    const spawned = replacement ?? await host.spawnRpc(launch, sessionFile ? sessionId : null, { replaceAdvisor: advisor !== undefined, preparing: preparingCommand, ...(authorize ? { authorize } : {}) });
     const proc = new RpcProcess({
       cwd: spawned.cwd,
       transport: spawned.transport,

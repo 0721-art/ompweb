@@ -1,7 +1,7 @@
 import { grant, has } from "./tool-approval-store";
 import { resolveToolPolicy, type CapabilityId, type OperationPolicy } from "./tool-access-policy";
 import { readWebServerSettingsFromDisk } from "./web-settings";
-import { withToolPolicyLock } from "./tool-policy-lock";
+import { readToolPolicyGeneration, withToolPolicyLock } from "./tool-policy-lock";
 
 export interface ToolCaller {
   agentId?: string;
@@ -77,8 +77,10 @@ export function hasToolCapabilityAuthorization(
   resourceType: string,
   resourceKey: string,
   caller?: ToolCaller,
+  policyGeneration?: number,
 ): boolean {
-  return withToolPolicyLock(() => {
+  return withToolPolicyLock((lock) => {
+    if (policyGeneration !== undefined && readToolPolicyGeneration(lock, capability) !== policyGeneration) return false;
     const policy = resolved({ capability, caller, sessionId, capabilityLabel: capability, confirm: async () => false });
     return policy.allowed && (policy.caller.confirmation === "allow" || has(sessionId, resourceType, resourceKey, capability));
   });

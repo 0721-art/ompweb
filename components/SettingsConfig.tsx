@@ -401,7 +401,7 @@ function GithubWritesSetting() {
       if (alive && policy) setEnabled(policy.enabled && policy.confirmation === "allow");
     };
     window.addEventListener(TOOL_POLICIES_SAVED_EVENT, saved);
-    void load().then((value) => { if (alive && value !== null) setEnabled(value); });
+    void load();
     return () => { alive = false; window.removeEventListener(TOOL_POLICIES_SAVED_EVENT, saved); };
   }, [load]);
   const change = async (next: boolean) => {
@@ -465,7 +465,7 @@ function GithubActionsPermissionsSetting() {
       if (alive) setPermissions(next);
     };
     window.addEventListener(TOOL_POLICIES_SAVED_EVENT, saved);
-    void load().then((value) => { if (alive && value !== null) setPermissions(value); });
+    void load();
     return () => { alive = false; window.removeEventListener(TOOL_POLICIES_SAVED_EVENT, saved); };
   }, [load]);
   const change = async (operation: GithubActionsOperation, next: GithubActionsPermission) => {

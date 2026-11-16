@@ -121,30 +121,37 @@ test("an uncertain GitHub Actions save re-fetches disk state and never presents 
   assert.equal(dispatch.disabled, true, "a failed reconciliation leaves the permission unknown");
 });
 
-test("late initial GETs cannot overwrite a newer successful PUT response", async (t) => {
-  const pendingAgent = Promise.withResolvers();
+test("initial settings GET setters cannot overwrite a successful policy PUT", async (t) => {
   const pendingDiscussions = Promise.withResolvers();
+  const pendingActions = Promise.withResolvers();
+  const pendingPut = Promise.withResolvers();
   let gets = 0;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     if (String(url) !== "/api/web-settings") return Response.json({});
-    if (init?.method === "PUT") return Response.json(policies("allow", "allow", "allow", true, "allow"));
+    if (init?.method === "PUT") return { ok: true, json: () => pendingPut.promise };
     gets++;
-    if (gets === 1) return pendingAgent.promise;
-    if (gets === 2) return pendingDiscussions.promise;
-    return Response.json(policies("ask", "ask", "ask"));
+    if (gets === 2) return { ok: true, json: () => pendingDiscussions.promise };
+    if (gets === 3) return { ok: true, json: () => pendingActions.promise };
+    return Response.json(policies("ask", "ask", "ask", false, "ask"));
   };
   t.after(() => { cleanup(); globalThis.fetch = originalFetch; });
 
   const { container } = render(createElement(SettingsConfig, settingsProps));
   await settle();
   const page = within(container);
-  await choose(page.getByRole("combobox", { name: "Dispatch workflows" }), "Allow without asking");
-  pendingAgent.resolve(Response.json(policies("ask", "ask", "ask", false, "ask")));
-  pendingDiscussions.resolve(Response.json(policies("ask", "ask", "ask", false, "ask")));
+  const agentTools = page.getByRole("switch", { name: "Agent tools (cross-session)" });
+  act(() => fireEvent.click(agentTools));
   await settle();
 
-  assert.equal(page.getByRole("switch", { name: "Agent tools (cross-session)" }).getAttribute("aria-checked"), "true");
+  await act(async () => {
+    pendingDiscussions.resolve(policies("ask", "ask", "ask", false, "ask"));
+    pendingActions.resolve(policies("ask", "ask", "ask", false, "ask"));
+    pendingPut.resolve(policies("allow", "allow", "allow", true, "allow"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  });
+
+  assert.equal(agentTools.getAttribute("aria-checked"), "true");
   assert.equal(page.getByRole("switch", { name: "Allow agent GitHub writes without asking" }).getAttribute("aria-checked"), "true");
   assert.equal(page.getByRole("combobox", { name: "Dispatch workflows" }).textContent, "Allow without asking");
 });

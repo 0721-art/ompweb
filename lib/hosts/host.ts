@@ -49,7 +49,7 @@ export interface Host {
   status(): HostStatus;
   onStatus(listener: (status: HostStatus) => void): () => void;
   /** `env`: extra child environment, over the agentEnv setting; only this machine's host honours it. */
-  spawnRpc(request: SpawnRequest, sessionId?: string | null, options?: { replaceAdvisor?: boolean; preparing?: boolean; expectedChannel?: string; env?: Record<string, string> }): Promise<SpawnResult>;
+  spawnRpc(request: SpawnRequest, sessionId?: string | null, options?: { replaceAdvisor?: boolean; preparing?: boolean; expectedChannel?: string; env?: Record<string, string>; authorize?: () => Promise<unknown> }): Promise<SpawnResult>;
   sessionFileExists(path: string): Promise<boolean>;
   invalidateSessionLists(sessionFile?: string): void;
   autoApproveExtension(): boolean;

@@ -151,6 +151,7 @@ export const localHost: Omit<Host, "workspaceOps" | "supportsWorkspaceOp"> = {
         throw new HostOpError(409, "prepared_cwd_changed", "The prepared worktree is no longer available");
       }
     }
+    await options?.authorize?.();
     const transport = spawnOmpTransport({
       cwd,
       // Re-read per spawn so a respawn picks up environment values the user

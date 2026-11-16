@@ -1503,7 +1503,8 @@ export class RemoteHost implements Host {
     };
   }
 
-  async spawnRpc(spawnRequest: SpawnRequest, sessionId: string | null = null, options?: { replaceAdvisor?: boolean; preparing?: boolean; expectedChannel?: string }): Promise<SpawnResult> {
+  async spawnRpc(spawnRequest: SpawnRequest, sessionId: string | null = null, options?: { replaceAdvisor?: boolean; preparing?: boolean; expectedChannel?: string; authorize?: () => Promise<unknown> }): Promise<SpawnResult> {
+    const { authorize, ...openOptions } = options ?? {};
     const link = linkFor(this.id);
     if (link.status === "omp-missing") throw new HostOpError(503, "host_omp_missing", `omp is not installed on ${this.label}`);
     const { creationId } = spawnRequest;
@@ -1548,8 +1549,9 @@ export class RemoteHost implements Host {
       sharing = sharesCredentials(record, pools);
     }
     const launch = { ...spawnRequest, ...(sharing ? { shareCredentials: true as const } : {}), ...(configVersion === undefined ? {} : { configVersion }) };
-    const opening: OpenChannelRequest = { sessionId, launch, ...options };
+    const opening: OpenChannelRequest = { sessionId, launch, ...openOptions };
     // An open may wait for a cold child's `ready`, which sends nothing meanwhile.
+    await authorize?.();
     return await request(this.id, "open", opening, LINK_LIMITS.channelReadyMs + linkTimings.opTimeoutMs, (value) => {
       if (!isOpenResult(value) || (options?.expectedChannel !== undefined && value.ch !== options.expectedChannel)) {
         throw new HostOpError(502, "host_bad_result", `${this.label} sent an invalid open result`);

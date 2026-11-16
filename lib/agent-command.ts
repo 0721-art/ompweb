@@ -52,7 +52,7 @@ function sendFences(): Map<string, Promise<void>> {
  * the browser socket. `owner`: the caller's web session (lib/web-auth.ts
  * `requestOwner`), whose uploads a prompt may attach. Never throws: failures
  * become `commandErrorResponse`. */
-export async function runAgentCommand(id: string, body: unknown, advisor: boolean, owner: string, trustedUploads?: OutboxUploadReceipt[]): Promise<Response> {
+export async function runAgentCommand(id: string, body: unknown, advisor: boolean, owner: string, trustedUploads?: OutboxUploadReceipt[], beforeSend?: () => Promise<unknown>): Promise<Response> {
   let release = () => {}; // frees this command's send fence; idempotent
   try {
     const command = body as { type?: unknown; [key: string]: unknown } | null;
@@ -83,12 +83,17 @@ export async function runAgentCommand(id: string, body: unknown, advisor: boolea
       });
     }
     if (prior) await prior;
+    const sendNative = async (session: AgentSessionWrapper, nativeCommand: typeof command) => {
+      await beforeSend?.();
+      return session.send(nativeCommand);
+    };
     const send = async (session: AgentSessionWrapper) => {
-      if (!uploads) return session.send(command);
+      if (!uploads) return sendNative(session, command);
       return session.withPendingCommand(async () => {
         let sending: Promise<unknown>;
         try {
           await attachUploads(uploads.ids, owner, session, command, uploads.receipts);
+          await beforeSend?.();
           sending = session.send(command);
         } finally {
           release();
@@ -149,7 +154,7 @@ export async function runAgentCommand(id: string, body: unknown, advisor: boolea
         ? `${command.provider}/${command.modelId}`
         : undefined;
 
-    const { session } = await startRpcSession(id, target.sessionFile, target.cwd, undefined, advisor, target.recordedCwd, spawnModel, host, true);
+    const { session } = await startRpcSession(id, target.sessionFile, target.cwd, undefined, advisor, target.recordedCwd, spawnModel, host, true, undefined, beforeSend);
     // This command inherits the open's preparation lease, so the shared child cannot idle out before it is sent.
     return await session.withPendingCommand(async () => {
       if (spawnModel) {
@@ -162,10 +167,10 @@ export async function runAgentCommand(id: string, body: unknown, advisor: boolea
         // rather than a false failure. A mismatch (e.g. an omp without --model
         // precedence) rethrows the RPC error, so a real failure still surfaces.
         try {
-          const result = await session.send(command);
+          const result = await sendNative(session, command);
           return Response.json({ success: true, data: result });
         } catch (error) {
-          const state = (await session.send({ type: "get_state" })) as {
+          const state = (await sendNative(session, { type: "get_state" })) as {
             model?: { id?: unknown; provider?: unknown };
           } | null;
           if (state?.model?.provider === command.provider && state?.model?.id === command.modelId) {

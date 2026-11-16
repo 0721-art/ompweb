@@ -22,7 +22,6 @@ import { MAX_UPLOADS_PER_MESSAGE, UPLOAD_ID_RE } from "./upload-limits";
 import { snapshotOutboxUploads, UploadError, type OutboxUploadReceipt } from "./uploads";
 import { resolveWebAuthSecret } from "./web-auth-secret";
 import { hasToolCapabilityAuthorization, type ToolCaller } from "./tool-policy-runtime";
-import { currentToolPolicyGeneration } from "./tool-policy-lock";
 
 /** Delivered (and removed) ids answer a repeated `outbox_add` this long (spec O2: idempotent by id); the browser gives
  * up resending after 7 days, so a resend always finds its id. */
@@ -43,8 +42,8 @@ const COLUMNS = "id, session_id, mode, message, images, uploads, owner, advisor,
 const RECEIPT_PIN_SCHEMA = "CREATE TABLE IF NOT EXISTS github_receipt_pins (session_id TEXT NOT NULL, entry_id TEXT NOT NULL, PRIMARY KEY (entry_id, session_id))";
 const WATCH_OWNER_PREFIX = `${GITHUB_WATCH_OUTBOX_OWNER}:`;
 
-function persistedWatchOwner(authorization: { caller?: ToolCaller; repository: string }): string {
-  return `${WATCH_OWNER_PREFIX}${Buffer.from(JSON.stringify({ ...authorization, policyGeneration: currentToolPolicyGeneration("github.read_watch") })).toString("base64url")}`;
+function persistedWatchOwner(authorization: { caller?: ToolCaller; repository: string; policyGeneration: number }): string {
+  return `${WATCH_OWNER_PREFIX}${Buffer.from(JSON.stringify(authorization)).toString("base64url")}`;
 }
 
 function watchAuthorization(owner: string): { caller?: ToolCaller; repository: string; policyGeneration: number } | null {
@@ -65,11 +64,14 @@ function watchAuthorization(owner: string): { caller?: ToolCaller; repository: s
 
 function watchEntryAuthorized(entry: Row): boolean {
   const authorization = watchAuthorization(entry.owner);
-  return authorization !== null
-    && authorization.policyGeneration === currentToolPolicyGeneration("github.read_watch")
-    && hasToolCapabilityAuthorization(
-      "github.read_watch", entry.session_id, "github.repository", authorization.repository, authorization.caller,
-    );
+  return authorization !== null && hasToolCapabilityAuthorization(
+    "github.read_watch",
+    entry.session_id,
+    "github.repository",
+    authorization.repository,
+    authorization.caller,
+    authorization.policyGeneration,
+  );
 }
 
 const isWatchEntryOwner = (owner: string): boolean => owner === GITHUB_WATCH_OUTBOX_OWNER || owner.startsWith(WATCH_OWNER_PREFIX);
@@ -510,7 +512,7 @@ export async function runOutboxCommand(
   command: Record<string, unknown>,
   advisor: boolean,
   owner: string,
-  authorization?: { caller?: ToolCaller; repository: string },
+  authorization?: { caller?: ToolCaller; repository: string; policyGeneration: number },
 ): Promise<Response> {
   if (command.type === "outbox_scope") return Response.json({ success: true, data: { scope: outboxScope() } });
   const scope = outboxScope();
@@ -582,9 +584,9 @@ export async function runOutboxCommand(
         const confirmsReplacement = confirmedReplacementId(concurrent, sessionId, replaces);
         return { kind: "existing", entry: concurrent, ...(confirmsReplacement ? { replaces: confirmsReplacement } : {}) };
       }
-      // Host discovery may have awaited while another server disabled the watcher.
       if (owner === GITHUB_WATCH_OUTBOX_OWNER && (!authorization
-        || !hasToolCapabilityAuthorization("github.read_watch", sessionId, "github.repository", authorization.repository, authorization.caller))) {
+        || !Number.isSafeInteger(authorization.policyGeneration) || authorization.policyGeneration < 0
+        || !hasToolCapabilityAuthorization("github.read_watch", sessionId, "github.repository", authorization.repository, authorization.caller, authorization.policyGeneration))) {
         return { kind: "paused" };
       }
       const original = typeof replaces === "string" ? row(replaces) : null;
@@ -965,11 +967,13 @@ async function deliver(entry: Row): Promise<Outcome> {
     // The host's sweep has removed the staged files by now (spec O3): never send the message without them.
     return fail(entry, "The attached files are gone: attach them again", false);
   }
-  // Start (or join) the session's omp first, as any command would, so the echo watch is on the wrapper that gets it.
+  const reauthorizeWatch = isWatchEntryOwner(entry.owner) ? async () => {
+    if (!watchEntryAuthorized(entry)) throw new Error("GitHub watch authorization is no longer valid.");
+  } : undefined;
   const priorWrapper = getRpcSession(sessionId);
   const generation = priorWrapper?.getMessageCommandGeneration() ?? 0;
   const competingPending = priorWrapper?.hasPendingMessageCommands() ?? false;
-  const started = await runAgentCommand(sessionId, { type: "get_state" }, entry.advisor === 1, entry.owner);
+  const started = await runAgentCommand(sessionId, { type: "get_state" }, entry.advisor === 1, entry.owner, undefined, reauthorizeWatch);
   if (isWatchEntryOwner(entry.owner) && !watchEntryAuthorized(entry)) {
     retire(entry.id, "none");
     releaseOutboxReceipt(entry.id);
@@ -1084,7 +1088,13 @@ async function deliver(entry: Row): Promise<Outcome> {
   publish(sessionId);
   try {
     // attachUploads mutates this same command before writing it: the watcher matches the final attachment block too.
-    const response = await runAgentCommand(sessionId, command, current.advisor === 1, current.owner, uploadReceipts);
+    const response = await runAgentCommand(sessionId, command, current.advisor === 1, current.owner, uploadReceipts, reauthorizeWatch);
+    if (isWatchEntryOwner(current.owner) && !watchEntryAuthorized(current)) {
+      retire(current.id, "none");
+      releaseOutboxReceipt(current.id);
+      publish(current.session_id);
+      return "next";
+    }
     if (!response.ok) {
       // Nothing was written: a gone child is retried, and any other refusal is classified as not sent.
       const written = nativeWriteStarted(command);
