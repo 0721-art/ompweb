@@ -1513,6 +1513,7 @@
   "settingsConfig.autoSaved": "已自動儲存",
   "settingsConfig.searchPlaceholder": "搜尋設定...",
   "settingsConfig.closeSettings": "關閉設定",
+  "settingsConfig.moreInformationAbout": "關於「{label}」的更多資訊",
   "settingsConfig.noSettingsMatch": "找不到與「{query}」相符的設定。",
   "settingsConfig.searchResults.one": "找到 {count} 個與「{query}」相符的結果。",
   "settingsConfig.searchResults.other": "找到 {count} 個與「{query}」相符的結果。",

@@ -1,6 +1,7 @@
 import "../tests/setup-dom.mjs";
 import assert from "node:assert/strict";
 import test, { afterEach } from "node:test";
+import { readFileSync } from "node:fs";
 import { createElement } from "react";
 const { cleanup, render, screen, within } = await import("@testing-library/react/pure.js");
 const { NativeSetting, matchSettingSearch } = await import("./SettingsConfig.tsx");
@@ -61,4 +62,16 @@ test("detailed information participates in search without replacing the short re
   assert.equal(result?.id, "dispatch");
   assert.equal(result?.description, "Start a selected workflow.");
   assert.equal("info" in result, false);
+});
+
+test("information button labels are localized for every non-English locale", () => {
+  const expected = {
+    "ja.json": "「{label}」の詳細情報",
+    "zh-CN.json": "有关“{label}”的更多信息",
+    "zh-TW.json": "關於「{label}」的更多資訊",
+  };
+  for (const [file, value] of Object.entries(expected)) {
+    const locale = JSON.parse(readFileSync(new URL(`../lib/i18n/locales/${file}`, import.meta.url), "utf8"));
+    assert.equal(locale["settingsConfig.moreInformationAbout"], value);
+  }
 });

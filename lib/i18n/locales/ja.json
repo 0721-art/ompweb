@@ -1473,6 +1473,7 @@
   "settingsConfig.autoSaved": "Auto-saved",
   "settingsConfig.searchPlaceholder": "Search settings...",
   "settingsConfig.closeSettings": "Close settings",
+  "settingsConfig.moreInformationAbout": "「{label}」の詳細情報",
   "settingsConfig.noSettingsMatch": "No settings match “{query}”.",
   "settingsConfig.searchResults.one": "{count} result for “{query}”.",
   "settingsConfig.searchResults.other": "{count} results for “{query}”.",

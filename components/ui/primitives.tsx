@@ -131,21 +131,23 @@ export const DialogClose = BaseDialog.Close;
 
 /* ---------------------------------- Tooltip -------------------------------- */
 
-export function Tooltip({ content, children, side = "top", open, onOpenChange }: {
+export function Tooltip({ content, children, side = "top", id, disabled, keepMounted }: {
   content: React.ReactNode;
   children: React.ReactElement;
   side?: "top" | "bottom" | "left" | "right";
-  open?: boolean;
-  onOpenChange?: (open: boolean) => void;
+  id?: string;
+  disabled?: boolean;
+  keepMounted?: boolean;
 }) {
   return (
     <BaseTooltip.Provider delay={350} closeDelay={0}>
-      <BaseTooltip.Root open={open} onOpenChange={onOpenChange}>
+      <BaseTooltip.Root disabled={disabled}>
         <BaseTooltip.Trigger render={children} />
-        <BaseTooltip.Portal keepMounted={open !== undefined}>
+        <BaseTooltip.Portal keepMounted={keepMounted}>
           <BaseTooltip.Positioner side={side} sideOffset={6} style={{ zIndex: 1100 }}>
             <BaseTooltip.Popup
               role="tooltip"
+              id={id}
               style={{
                 background: "var(--bg-panel)",
                 color: "var(--text)",

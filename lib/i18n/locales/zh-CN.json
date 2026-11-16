@@ -1473,6 +1473,7 @@
   "settingsConfig.autoSaved": "已自动保存",
   "settingsConfig.searchPlaceholder": "搜索设置…",
   "settingsConfig.closeSettings": "关闭设置",
+  "settingsConfig.moreInformationAbout": "有关“{label}”的更多信息",
   "settingsConfig.noSettingsMatch": "未找到与“{query}”匹配的设置。",
   "settingsConfig.searchResults.one": "共找到 {count} 个与“{query}”匹配的设置项。",
   "settingsConfig.searchResults.other": "共找到 {count} 个与“{query}”匹配的设置项。",
