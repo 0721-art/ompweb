@@ -181,3 +181,20 @@ Fix-round 3 verification:
 - `bun test --timeout 30000 app/api/tool-approvals/route.test.mjs lib/tool-policy-runtime.test.mjs lib/tool-approval-store.test.mjs lib/github/watcher.test.mjs` — 49 pass, 0 fail.
 - `npm run typecheck` — pass.
 - Scoped ESLint — pass.
+
+## Task 4B fix round 5: moved-scope revocation and reload settlement
+
+- Captured the legal moved session's approval generation under the policy lock and fenced remembered-grant promotion against both the original claim identity and destination session. A second claim cannot restore a grant revoked at the moved identity.
+- Before reload disposes the original process, settled every claimed `open_url` with the browser-specific unknown outcome and withdrew the claim; late results cannot reach the replacement process.
+- Claimed browser outcomes now say exactly: `The browser URL may already have opened. MUST NOT be retried automatically.`
+
+
+Verification:
+
+- RED reproduced destination-session grant recreation after B's revocation, generic `list_sessions` guidance on claimed browser termination, and reload without settlement on the original child.
+- Focused browser-claim regressions — 4 pass, 0 fail.
+- `npm run typecheck` — pass.
+- Scoped ESLint on `lib/rpc-manager.ts`, `lib/rpc-manager.test.mjs` and `lib/tool-policy-runtime.ts` — pass.
+- Full `npm run lint` — fails on existing unused imports/variables in `lib/github/watcher.test.mjs:14` and `lib/tool-policy-runtime.test.mjs:2`, plus 7 existing React hook warnings.
+- `bun test --parallel --timeout 30000 lib/rpc-manager.test.mjs lib/tool-policy-runtime.test.mjs lib/tool-approval-store.test.mjs app/api/tool-approvals/route.test.mjs hooks/useAgentSession.rpc.test.mjs hooks/useAgentSession-stream.local-file.test.mjs lib/event-stream-protocol.test.mjs lib/browser-link.test.mjs lib/agent-client.test.mjs` — 572 pass, 0 fail across 8 files.
+

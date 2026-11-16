@@ -8,6 +8,7 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ### Fixed
 
+- **Browser URL claims stay safe across moves, revocation and reload.** A successful claimed open remembers its origin only for the legal current session and cannot recreate a grant revoked there. Reload, disconnect, cancellation or a lost result tells the agent the URL may already have opened and must not be retried automatically.
 - **Restore HTTP LAN and VPN access.** Browser UUID generation now works without secure-context-only `crypto.randomUUID()`, preventing the "Something went wrong" crash when opening the app or creating a session.
 - **Open live subagent transcripts without waiting forever.** Transcript pages now read the subagent's on-disk artifact directly instead of waiting for its busy agent process to answer first.
 

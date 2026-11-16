@@ -21,7 +21,7 @@ import {
   type AgentToolSessionOps,
 } from "./agent-tools";
 import type { AgentToolHost } from "./agent-tool-hosts";
-import { claimDeferredToolAuthorization, promoteClaimedToolApproval, resolveDeferredToolAuthorization, validateToolCaller, type DeferredToolAuthorization, type ToolCaller } from "./tool-policy-runtime";
+import { claimDeferredToolAuthorization, currentToolApprovalGeneration, promoteClaimedToolApproval, resolveDeferredToolAuthorization, validateToolCaller, type DeferredToolAuthorization, type ToolCaller } from "./tool-policy-runtime";
 import type { CapabilityId } from "./tool-access-policy";
 import { createGithubToolOps, GITHUB_REPLAY_SAFE_TOOLS, GITHUB_TOOL_NAMES } from "./github/tools";
 import { markShuttingDown, recordRunningSessions, resumeOnHostLink, takeInterruptedSessions, type InterruptibleSession } from "./session-resume";
@@ -138,8 +138,10 @@ const RESTARTING_MESSAGE = "This session is restarting — retry in a moment.";
 /** Answer to a replayed server agent tool call that changes things: it may have run before the restart. */
 const AGENT_TOOL_UNKNOWN_OUTCOME = "omp-web restarted while this ran; the outcome is unknown, check with list_sessions before retrying";
 const GITHUB_UNKNOWN_OUTCOME = "omp-web restarted while this ran; the outcome is unknown. Inspect workflow runs with github_run_list or github_read; inspect comments or threads with github_read for other writes. Do not automatically repeat a dispatch or rerun.";
+/** A browser action may have succeeded even when omp-web cannot observe its result. */
+const BROWSER_OPEN_URL_UNKNOWN_OUTCOME = "The browser URL may already have opened. MUST NOT be retried automatically.";
 /** A GitHub write is checked on GitHub, not in the session list. */
-const unknownOutcome = (toolName: unknown) => (typeof toolName === "string" && GITHUB_TOOL_NAMES.has(toolName) ? GITHUB_UNKNOWN_OUTCOME : AGENT_TOOL_UNKNOWN_OUTCOME);
+const unknownOutcome = (toolName: unknown) => (toolName === "open_url" ? BROWSER_OPEN_URL_UNKNOWN_OUTCOME : typeof toolName === "string" && GITHUB_TOOL_NAMES.has(toolName) ? GITHUB_UNKNOWN_OUTCOME : AGENT_TOOL_UNKNOWN_OUTCOME);
 const OPEN_URL_CLAIM_TTL_MS = 60_000;
 
 function parseOpenUrl(event: UnsequencedAgentEvent): URL {
@@ -550,6 +552,7 @@ export class AgentSessionWrapper {
         sessionId: string;
         generation: number;
         approvalGeneration: number;
+        grantApprovalGeneration: number;
         approvalClearGeneration: number;
         rememberOnSuccess: boolean;
         expiresAt: number;
@@ -1069,6 +1072,18 @@ export class AgentSessionWrapper {
     if (moved) {
       this.sessionMovePending = false;
       if (oldId !== this._sessionId) {
+        const generations = new Map<string, number>();
+        for (const pending of this.pendingHostTools.values()) {
+          const openUrl = pending.openUrl;
+          if (!openUrl) continue;
+          let grantApprovalGeneration = generations.get(openUrl.origin);
+          if (grantApprovalGeneration === undefined) {
+            grantApprovalGeneration = currentToolApprovalGeneration(this._sessionId, "url.origin", openUrl.origin, "browser.open_url");
+            generations.set(openUrl.origin, grantApprovalGeneration);
+          }
+          if (openUrl.claim) openUrl.claim.grantApprovalGeneration = grantApprovalGeneration;
+          else openUrl.approvalGeneration = grantApprovalGeneration;
+        }
         // Tabs still showing the old id are still viewing this conversation.
         this.movedFromIds.push(oldId);
         // Keep the old id routable: other tabs still address it, and a fresh
@@ -2482,6 +2497,9 @@ export class AgentSessionWrapper {
       this.restartingProc = null;
       throw error;
     }
+    for (const [id, pending] of this.pendingHostTools) {
+      if (pending.openUrl?.claim) this.settleClaimedOpenUrlUnknown(id, pending);
+    }
     this.resetStream();
     this.streaming = false;
     this.promptRunning = false;
@@ -3121,6 +3139,7 @@ export class AgentSessionWrapper {
             sessionId: claimed.sessionId,
             generation: claimed.generation,
             approvalGeneration: claimed.approvalGeneration,
+            grantApprovalGeneration: claimed.approvalGeneration,
             approvalClearGeneration: claimed.approvalClearGeneration,
             rememberOnSuccess: claimed.rememberOnSuccess,
             expiresAt,
@@ -3167,8 +3186,7 @@ export class AgentSessionWrapper {
                   capabilityLabel: "open browser URLs",
                   resourceType: "url.origin",
                   resourceKey: pending.openUrl.origin,
-                  caller: pending.openUrl.caller,
-                }, currentSessionId, claim.sessionId, claim.generation, claim.approvalGeneration, claim.approvalClearGeneration,
+                }, currentSessionId, claim.sessionId, claim.generation, claim.approvalGeneration, claim.grantApprovalGeneration, claim.approvalClearGeneration,
                 () => this.pendingHostTools.get(id) === pending && pending.openUrl?.claim === claim);
               }
             }

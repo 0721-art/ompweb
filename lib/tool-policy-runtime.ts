@@ -126,6 +126,10 @@ export function resolveDeferredToolAuthorization(input: DeferredToolAuthorizatio
   });
 }
 
+export function currentToolApprovalGeneration(sessionId: string, resourceType: string, resourceKey: string, capability: CapabilityId): number {
+  return withToolPolicyLock((lock) => readToolApprovalGeneration(lock, sessionId, resourceType, resourceKey, capability));
+}
+
 /** Atomically claim one pending browser action without persisting remembered authority. */
 export function claimDeferredToolAuthorization(
   input: DeferredToolAuthorizationInput,
@@ -170,6 +174,7 @@ export function promoteClaimedToolApproval(
   approvalSessionId: string,
   expectedGeneration: number,
   expectedApprovalGeneration: number,
+  expectedGrantApprovalGeneration: number,
   expectedApprovalClearGeneration: number,
   isPending: () => boolean,
 ): void {
@@ -179,6 +184,7 @@ export function promoteClaimedToolApproval(
     }
     if (readToolPolicyGeneration(lock, input.capability) !== expectedGeneration) return;
     if (readToolApprovalGeneration(lock, approvalSessionId, input.resourceType, input.resourceKey, input.capability) !== expectedApprovalGeneration
+      || readToolApprovalGeneration(lock, grantSessionId, input.resourceType, input.resourceKey, input.capability) !== expectedGrantApprovalGeneration
       || readToolApprovalClearGeneration(lock) !== expectedApprovalClearGeneration) return;
     const current = resolved(deferredInput(input));
     const confirmationRequired = current.allowed
