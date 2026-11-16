@@ -115,6 +115,8 @@ export interface AgentToolCreateSessionInput {
 
 export interface AgentToolDeliverInput {
   sessionId: string;
+  /** Host whose approval policy was checked before delivery. */
+  hostId: string;
   /** Already sender-attributed by executeAgentTool. */
   message: string;
   delivery: "prompt" | "steer" | "followUp";
@@ -370,6 +372,7 @@ export async function executeAgentTool(
     const requestedHost = optionalString(record, "host");
     const host = resolveHost(ops.listHosts(), requestedHost ?? ctx.sourceHostId);
     if (shareWorkspace && host.id !== ctx.sourceHostId) throw new Error("shareWorkspace requires the calling session's host.");
+    if (ctx.signal?.aborted) throw new Error("The agent tool call was cancelled before a session was started.");
     const created = await ops.createSession({
       cwd,
       hostId: host.id,
@@ -414,6 +417,7 @@ export async function executeAgentTool(
   if (ctx.signal?.aborted) throw new Error("The agent tool call was cancelled before the message was sent.");
   const result = await ops.deliver({
     sessionId,
+    hostId: targetHostId,
     message: formatAttributedMessage(ctx.sourceSessionId, message),
     delivery,
     wait,

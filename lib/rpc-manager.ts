@@ -3432,10 +3432,16 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
     listHosts: hosts,
 
     async createSession(input, authorize) {
-      const authorizeHost = (host: Host) => {
+      const throwIfCancelled = () => {
+        if (source.signal?.aborted) throw new Error("The agent tool call was cancelled before a session was started.");
+      };
+      const authorizeHost = async (host: Host) => {
+        throwIfCancelled();
         const configured = this.listHosts().find((candidate) => candidate.id === host.id);
         if (!configured) throw new Error(`Unknown host: ${host.id}`);
-        return authorize(configured);
+        const allowed = await authorize(configured);
+        throwIfCancelled();
+        return allowed;
       };
       const initialize = async (session: AgentSessionWrapper, preserveUnknownDelivery: boolean) => {
         if (input.provider && input.modelId) {
@@ -3446,6 +3452,7 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
       };
       if (!input.shareWorkspace && !input.explicitHost && input.hostId === source.sourceHostId) {
         const sessions = await listSessionsAllHosts();
+        throwIfCancelled();
         const origin = sessions.find((session) => session.id === source.sourceSessionId && (session.hostId ?? LOCAL_HOST_ID) === source.sourceHostId);
         const bindings = poolProjectBindings(loadPools()).get(source.sourceHostId);
         const binding = bindings?.get(comparableProjectPath(input.cwd === source.sourceCwd
@@ -3454,6 +3461,7 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
           const creationId = createHash("sha256").update("ompweb:agent-creation:v1:")
             .update(JSON.stringify([source.sourceSessionId, source.sourceRequestId])).digest("hex");
           const result = await startPooledSession({ creationId, poolId: binding.pool.id, projectId: binding.project.id, intent: { ...input } }, async (host, prepared, id, onStarted) => {
+            throwIfCancelled();
             const started = await startNewRpcSession(host, prepared.cwd, undefined, false, true, id);
             if (!started.ok) throw new HostOpError(started.status, started.code, started.error);
             const { session, realSessionId } = started.value;
@@ -3470,6 +3478,7 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
       if (!host) throw new Error(`Unknown host: ${input.hostId}`);
       if (!(await authorizeHost(host))) throw new Error(`The user declined to start a session on ${host.label}.`);
       const preparing = !!(input.prompt || input.name || (input.provider && input.modelId));
+      throwIfCancelled();
       const started = await startNewRpcSession(host, input.cwd, undefined, undefined, preparing);
       if (!started.ok) throw new Error(started.error);
       const { session, realSessionId } = started.value;
@@ -3487,10 +3496,16 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
 
     async deliver(input): Promise<AgentToolDeliverResult> {
       const live = getRpcSession(input.sessionId);
+      if (live?.isAlive() && live.host.id !== input.hostId) {
+        throw new Error(`Session ${input.sessionId} moved to another host; the message was not sent.`);
+      }
       let wrapper = live?.isAlive() ? live : undefined;
       let cold = false;
       if (!wrapper) {
         const host = await hostForSessionId(input.sessionId);
+        if (host && host.id !== input.hostId) {
+          throw new Error(`Session ${input.sessionId} moved to another host; the message was not sent.`);
+        }
         const target = host && await sessionSpawnTarget(input.sessionId, host);
         if (!host || !target) throw new Error(`Session not found: ${input.sessionId}`);
         // The open's preparation lease keeps an idle shared child (and its advisor mode) until the message is sent.
