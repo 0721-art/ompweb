@@ -1661,10 +1661,11 @@ export function AppShell({ appName }: { appName: string }) {
       if (result.openUrl) {
         if (!result.claimOpenUrl) throw new Error("Browser URL claim was not requested.");
         pending.claimId = randomUUID();
-        const claim = await sendAgentCommand<{ token?: unknown }>(call.sessionId, {
+        const claim = await sendAgentCommand<{ token?: unknown; expiresAt?: unknown }>(call.sessionId, {
           type: "authorize_open_url", id: call.id, claimId: pending.claimId,
         });
-        if (controller.signal.aborted || typeof claim?.token !== "string") return;
+        if (controller.signal.aborted || typeof claim?.token !== "string"
+          || typeof claim.expiresAt !== "number" || Date.now() >= claim.expiresAt) return;
         let opened = false;
         try {
           opened = await openUrl(result.openUrl, false, controller.signal);

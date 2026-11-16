@@ -549,6 +549,7 @@ export class AgentSessionWrapper {
         generation: number;
         rememberOnSuccess: boolean;
         expiresAt: number;
+        timer: NodeJS.Timeout;
       };
     };
   }>();
@@ -1682,11 +1683,16 @@ export class AgentSessionWrapper {
     });
   }
 
+  private clearOpenUrlClaimTimer(pending: { openUrl?: { claim?: { timer: NodeJS.Timeout } } }): void {
+    clearTimeout(pending.openUrl?.claim?.timer);
+  }
+
 
   /** Withdraw the browser operation using the identity under which it was delivered. */
   private cancelPendingHostTool(id: string): boolean {
     const pending = this.pendingHostTools.get(id);
     if (!pending) return false;
+    this.clearOpenUrlClaimTimer(pending);
     this.pendingHostTools.delete(id);
     this.unparkHostTool(id);
     const event = { type: "host_tool_cancel", targetId: id };
@@ -3066,13 +3072,36 @@ export class AgentSessionWrapper {
           }, pending.openUrl.generation, pending.openUrl.authorization === "confirmation_required",
           () => this.pendingHostTools.get(id) === pending && !pending.openUrl?.claim);
           const token = randomUUID();
+          const expiresAt = Date.now() + OPEN_URL_CLAIM_TTL_MS;
+          const timer = setTimeout(() => {
+            const current = this.pendingHostTools.get(id);
+            if (current !== pending || current.openUrl?.claim?.token !== token) return;
+            this.pendingHostTools.delete(id);
+            this.unparkHostTool(id);
+            const withdrawal = { type: "host_tool_cancel" as const, targetId: id };
+            this.emit(withdrawal);
+            if (pending.crossSessionId !== undefined) {
+              for (const listener of getHostToolListeners()) {
+                try { listener({ ...withdrawal, sessionId: pending.crossSessionId }); } catch { /* isolate listeners */ }
+              }
+            }
+            this.proc.sendFrame({
+              type: "host_tool_result",
+              id,
+              isError: true,
+              result: { content: [{ type: "text", text: unknownOutcome("open_url") }] },
+            });
+            notifyRunningChange();
+          }, OPEN_URL_CLAIM_TTL_MS);
+          timer.unref?.();
           pending.openUrl.claim = {
             claimId,
             token,
             sessionId: claimed.sessionId,
             generation: claimed.generation,
             rememberOnSuccess: claimed.rememberOnSuccess,
-            expiresAt: Date.now() + OPEN_URL_CLAIM_TTL_MS,
+            expiresAt,
+            timer,
           };
           const withdrawn = { type: "host_tool_cancel" as const, targetId: id, claimId };
           this.emit(withdrawn);
@@ -3081,7 +3110,7 @@ export class AgentSessionWrapper {
               try { listener({ ...withdrawn, sessionId: pending.crossSessionId }); } catch { /* isolate listeners */ }
             }
           }
-          return { token };
+          return { token, expiresAt };
         } catch (error) {
           this.pendingHostTools.delete(id);
           this.unparkHostTool(id);
@@ -3106,21 +3135,28 @@ export class AgentSessionWrapper {
               this.rejectBrowserOpenUrl(pending.event, error);
               throw error;
             }
-            if (command.isError !== true && claim.rememberOnSuccess) {
-              promoteClaimedToolApproval({
-                capability: "browser.open_url",
-                sessionId: claim.sessionId,
-                capabilityLabel: "open browser URLs",
-                resourceType: "url.origin",
-                resourceKey: pending.openUrl.origin,
-                caller: pending.openUrl.caller,
-              }, claim.sessionId, claim.generation,
-              () => this.pendingHostTools.get(id) === pending && pending.openUrl?.claim === claim);
+            if (command.isError !== true) {
+              const currentSessionId = this.sessionId;
+              if (currentSessionId !== claim.sessionId && !this.movedFromIds.includes(claim.sessionId)) {
+                throw new Error("The browser URL claim belongs to a different conversation.");
+              }
+              if (claim.rememberOnSuccess) {
+                promoteClaimedToolApproval({
+                  capability: "browser.open_url",
+                  sessionId: currentSessionId,
+                  capabilityLabel: "open browser URLs",
+                  resourceType: "url.origin",
+                  resourceKey: pending.openUrl.origin,
+                  caller: pending.openUrl.caller,
+                }, currentSessionId, claim.generation,
+                () => this.pendingHostTools.get(id) === pending && pending.openUrl?.claim === claim);
+              }
             }
           } else if (command.isError !== true || token !== undefined) {
             throw new Error("The browser URL request has not been claimed.");
           }
         }
+        if (pending) this.clearOpenUrlClaimTimer(pending);
         if (id) {
           this.pendingHostTools.delete(id);
           this.unparkHostTool(id);

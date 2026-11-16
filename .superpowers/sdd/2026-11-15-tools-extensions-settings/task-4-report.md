@@ -153,3 +153,18 @@ Fix-round verification:
 - `bun test --timeout 30000 lib/tool-policy-runtime.test.mjs lib/tool-approval-store.test.mjs lib/event-stream-protocol.test.mjs lib/browser-link.test.mjs lib/agent-client.test.mjs` — 70 pass, 0 fail.
 - `npm run typecheck` — pass.
 - Scoped ESLint — 0 errors; 5 pre-existing `react-hooks/exhaustive-deps` warnings in `components/AppShell.tsx`.
+
+## Task 4B fix round 2: claim lifetime, moves and revocation
+
+- Claim ACKs now include an absolute deadline. Both browser paths refuse to open after that deadline, while an identity-qualified server timer withdraws only the matching pending claim and settles a vanished winner as unknown outcome.
+- Successful claimed results resolve ownership against the wrapper's current legal identity. Session-persistence moves promote under the new identity; unrelated conversation switches reject the result.
+- Explicit per-grant revoke and clear-all now run under the tool-policy lock, bump authorization generations before deleting grants, and therefore invalidate every pre-revocation delayed promotion. A later claimed action may finish, but cannot recreate revoked authority.
+- Added deterministic coverage for delayed ACK, vanished winner, claim-before-move success, and two concurrent claims followed by revoke or clear before the second result.
+
+Fix-round 2 verification:
+
+- `bun test --timeout 30000 lib/rpc-manager.test.mjs` — 162 pass, 0 fail.
+- `bun test --timeout 30000 hooks/useAgentSession.rpc.test.mjs hooks/useAgentSession-stream.local-file.test.mjs` — 333 pass, 0 fail.
+- `bun test --timeout 30000 lib/tool-policy-runtime.test.mjs lib/tool-approval-store.test.mjs app/api/tool-approvals/route.test.mjs lib/event-stream-protocol.test.mjs lib/browser-link.test.mjs lib/agent-client.test.mjs` — 74 pass, 0 fail.
+- `npm run typecheck` — pass.
+- Scoped ESLint — 0 errors; 5 pre-existing `react-hooks/exhaustive-deps` warnings in `components/AppShell.tsx`.

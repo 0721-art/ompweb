@@ -1889,10 +1889,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (result.openUrl) {
         if (!result.claimOpenUrl) throw new Error("Browser URL claim was not requested.");
         pending.claimId = randomUUID();
-        const claim = await sendAgentCommand<{ token?: unknown }>(sid, {
+        const claim = await sendAgentCommand<{ token?: unknown; expiresAt?: unknown }>(sid, {
           type: "authorize_open_url", id, claimId: pending.claimId,
         });
-        if (controller.signal.aborted || typeof claim?.token !== "string") return;
+        if (controller.signal.aborted || typeof claim?.token !== "string"
+          || typeof claim.expiresAt !== "number" || Date.now() >= claim.expiresAt) return;
         let opened = false;
         try {
           opened = await openUrl(result.openUrl, false, controller.signal);

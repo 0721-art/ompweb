@@ -3428,9 +3428,9 @@ test("viewed open_url calls honor server authorization and confirm through their
     return true;
   };
   const { es } = await startRun("s1", "q1", false, { onOpenUrl });
-  const authorize = (id, token) => world.holds.push({
+  const authorize = (id, token, expiresAt = Date.now() + 60_000) => world.holds.push({
     match: (method, _url, body) => method === "POST" && body?.type === "authorize_open_url" && body.id === id,
-    produce: async () => ({ value: { success: true, data: { token } } }),
+    produce: async () => ({ value: { success: true, data: { token, expiresAt } } }),
   });
   authorize("asked-url", "asked-token");
 
@@ -3489,6 +3489,20 @@ test("viewed open_url calls honor server authorization and confirm through their
   assert.equal(blocked?.body.openUrlToken, "blocked-token");
   assert.equal(blocked?.body.isError, true, "opener failure is reported only after authorization");
   assert.match(blocked?.body.result.content[0].text ?? "", /did not open/);
+
+  authorize("expired-url", "expired-token", Date.now() - 1);
+  await act(async () => {
+    es.emit({
+      type: "host_tool_call",
+      id: "expired-url",
+      toolName: "open_url",
+      arguments: { url: "https://expired.test/" },
+      openUrlAuthorization: "authorized",
+    });
+    await sleep(30);
+  });
+  assert.equal(opened.includes("https://expired.test/"), false, "a delayed ACK past its deadline never opens");
+  assert.equal(callsTo("POST", "/api/agent/s1").some((call) => call.body?.type === "host_tool_result" && call.body.id === "expired-url"), false);
 
   await act(async () => {
     es.emit({ type: "host_tool_call", id: "legacy-url", toolName: "open_url", arguments: { url: "https://legacy.test/" } });
