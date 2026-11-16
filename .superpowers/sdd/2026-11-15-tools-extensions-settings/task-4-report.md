@@ -195,6 +195,6 @@ Verification:
 - Focused browser-claim regressions — 4 pass, 0 fail.
 - `npm run typecheck` — pass.
 - Scoped ESLint on `lib/rpc-manager.ts`, `lib/rpc-manager.test.mjs` and `lib/tool-policy-runtime.ts` — pass.
-- Full `npm run lint` — fails on existing unused imports/variables in `lib/github/watcher.test.mjs:14` and `lib/tool-policy-runtime.test.mjs:2`, plus 7 existing React hook warnings.
+- Full `npm run lint` — fails on unused `MAX_AGENT_COMMAND_REQUEST_BYTES` (`lib/github/watcher.test.mjs:14:9`) and `writeFileSync` (`lib/tool-policy-runtime.test.mjs:2:31`); 7 existing `react-hooks/exhaustive-deps` warnings remain at `components/AppShell.tsx:361,828,845,856,925`, `components/RecordingDeck.tsx:199` and `hooks/useDictation.ts:822`.
 - `bun test --parallel --timeout 30000 lib/rpc-manager.test.mjs lib/tool-policy-runtime.test.mjs lib/tool-approval-store.test.mjs app/api/tool-approvals/route.test.mjs hooks/useAgentSession.rpc.test.mjs hooks/useAgentSession-stream.local-file.test.mjs lib/event-stream-protocol.test.mjs lib/browser-link.test.mjs lib/agent-client.test.mjs` — 572 pass, 0 fail across 8 files.
 
