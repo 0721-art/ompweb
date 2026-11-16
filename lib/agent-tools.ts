@@ -1,6 +1,6 @@
 import type { HostToolDefinition } from "./pi-types";
 import { isRecord } from "./type-guards";
-import { hostStartsUnasked, type AgentToolHost } from "./agent-tool-hosts";
+import type { AgentToolHost } from "./agent-tool-hosts";
 import { authorizeToolCapability, type ToolCaller } from "./tool-policy-runtime";
 import { GITHUB_TOOL_DEFINITIONS, GITHUB_TOOL_NAMES, executeGithubTool, type GithubToolOps } from "./github/tools";
 
@@ -328,23 +328,24 @@ export async function executeAgentTool(
   ctx: AgentToolContext,
 ): Promise<unknown> {
   if (!AGENT_TOOL_NAMES.has(toolName)) throw new Error(`Unknown agent tool: ${toolName}.`);
-  await authorizeToolCapability({
-    capability: "ompweb.agent_tools",
-    sessionId: ctx.sourceSessionId,
-    capabilityLabel: "use omp-web agent tools",
-    confirm: ctx.confirm,
-    caller: ctx.caller,
-    signal: ctx.signal,
-  });
   const record = asRecord(args);
 
   if (GITHUB_TOOL_NAMES.has(toolName)) {
     ctx.guard.checkRate(ctx.sourceSessionId);
+    if (ctx.signal?.aborted) throw new Error("The tool call was cancelled.");
     return executeGithubTool(toolName, record, ops.github, ctx);
   }
 
   if (toolName === "list_sessions") {
     ctx.guard.checkRate(ctx.sourceSessionId);
+    await authorizeToolCapability({
+      capability: "ompweb.agent_tools",
+      sessionId: () => ctx.sourceSessionId,
+      capabilityLabel: "list omp-web sessions",
+      confirm: ctx.confirm,
+      caller: ctx.caller,
+      signal: ctx.signal,
+    });
     const labels = new Map(ops.listHosts().map((h) => [h.id, h.label]));
     const sessions = await ops.listSessions();
     return {
@@ -380,18 +381,21 @@ export async function executeAgentTool(
       modelId,
       name,
     }, async (target) => {
-      const targetPolicy = target.id === "local" && ctx.sourceHostId !== "local"
-        ? { enabled: true, confirmation: "ask" as const }
-        : target.agentStartPolicy;
       await authorizeToolCapability({
         capability: "ompweb.session_start",
-        sessionId: ctx.sourceSessionId,
+        sessionId: () => ctx.sourceSessionId,
         resourceType: "host",
         resourceKey: target.id,
         capabilityLabel: `start a session on ${target.label}`,
         confirm: ctx.confirm,
         caller: ctx.caller,
-        target: targetPolicy,
+        target: () => {
+          const fresh = ops.listHosts().find((candidate) => candidate.id === target.id);
+          if (!fresh) return { enabled: false, confirmation: "ask" };
+          return fresh.id === "local" && ctx.sourceHostId !== "local"
+            ? { enabled: true, confirmation: "ask" }
+            : fresh.agentStartPolicy;
+        },
         signal: ctx.signal,
       });
       return true;
@@ -411,19 +415,28 @@ export async function executeAgentTool(
   const delivery = parseDelivery(record);
   const { wait, waitTimeoutMs } = parseWait(record);
   const depth = ctx.guard.checkChainDepth(ctx.sourceSessionId);
-  // A remote agent reaching a session on another machine asks first, as new_session does.
-  if (ctx.sourceHostId !== "local") {
-    const targetHostId = await ops.sessionHostId(sessionId);
-    if (!targetHostId) throw new Error(`Session not found: ${sessionId}`);
-    const hosts = ops.listHosts();
-    const target = hosts.find((h) => h.id === targetHostId);
-    if (targetHostId !== ctx.sourceHostId && !(target && hostStartsUnasked(target) && target.id !== "local")) {
-      const sourceLabel = hosts.find((h) => h.id === ctx.sourceHostId)?.label ?? ctx.sourceHostId;
-      if (!(await ctx.confirm(`Send a message from a session on ${sourceLabel} to session ${sessionId} on ${target?.label ?? targetHostId}?`))) {
-        throw new Error(`The user declined to send a message to session ${sessionId}.`);
-      }
-    }
-  }
+  const targetHostId = await ops.sessionHostId(sessionId);
+  if (!targetHostId) throw new Error(`Session not found: ${sessionId}`);
+  const target = ops.listHosts().find((host) => host.id === targetHostId);
+  if (!target) throw new Error(`Unknown target host: ${targetHostId}`);
+  await authorizeToolCapability({
+    capability: "ompweb.session_start",
+    sessionId: () => ctx.sourceSessionId,
+    resourceType: "host",
+    resourceKey: targetHostId,
+    capabilityLabel: `send to session ${sessionId} on ${target.label}`,
+    confirm: ctx.confirm,
+    caller: ctx.caller,
+    target: () => {
+      const fresh = ops.listHosts().find((host) => host.id === targetHostId);
+      if (!fresh) return { enabled: false, confirmation: "ask" };
+      return fresh.id === "local" && ctx.sourceHostId !== "local"
+        ? { enabled: true, confirmation: "ask" }
+        : fresh.agentStartPolicy;
+    },
+    signal: ctx.signal,
+  });
+  if (ctx.signal?.aborted) throw new Error("The tool call was cancelled before sending.");
   const result = await ops.deliver({
     sessionId,
     message: formatAttributedMessage(ctx.sourceSessionId, message),

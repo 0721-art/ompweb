@@ -115,7 +115,7 @@ function parseIds(value: unknown): string[] | undefined {
 async function allowRead(_ops: GithubToolOps, ctx: AgentToolContext, t: Pick<GithubTarget, "owner" | "repo">): Promise<void> {
   await authorizeToolCapability({
     capability: "github.read_watch",
-    sessionId: ctx.sourceSessionId,
+    sessionId: () => ctx.sourceSessionId,
     resourceType: "github.repository",
     resourceKey: repoKeyOf(t),
     capabilityLabel: "read and watch GitHub",
@@ -129,7 +129,7 @@ async function allowRead(_ops: GithubToolOps, ctx: AgentToolContext, t: Pick<Git
 async function allowWrite(ctx: AgentToolContext, target: Pick<GithubTarget, "owner" | "repo">, title: string): Promise<void> {
   await authorizeToolCapability({
     capability: "github.discussions",
-    sessionId: ctx.sourceSessionId,
+    sessionId: () => ctx.sourceSessionId,
     resourceType: "github.repository",
     resourceKey: repoKeyOf(target),
     capabilityLabel: title,
@@ -202,7 +202,7 @@ export async function executeGithubTool(name: string, args: Record<string, unkno
   }
   if (name === "watch_github") {
     const itemKey = itemKeyOf(t);
-    const intent = beginWatchIntent(ctx.sourceSessionId, itemKey);
+    const intent = beginWatchIntent(ctx.sourceSessionId, itemKey, ctx.caller);
     try {
       await checkGh(ops.run);
       await allowRead(ops, ctx, t);

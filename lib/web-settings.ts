@@ -1,11 +1,11 @@
-import { DatabaseSync } from "node:sqlite";
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import { getAgentDir } from "./omp/paths";
 import { BROWSER_TRANSPORTS, type BrowserTransport, type BrowserTransportState } from "./event-stream-protocol";
 import { DEFAULT_UPLOAD_RETENTION_DAYS, isUploadRetentionDays } from "./upload-limits";
 import { isRecord } from "./type-guards";
 import { revokeCapability } from "./tool-approval-store";
+import { withToolPolicyLock } from "./tool-policy-lock";
 import {
   CAPABILITY_IDS,
   type CapabilityId,
@@ -164,9 +164,6 @@ function settingsPath(): string {
   return resolve(getAgentDir(), "omp-web-settings.json");
 }
 
-function settingsLockPath(): string {
-  return resolve(getAgentDir(), "omp-web-settings.lock.sqlite");
-}
 
 function normalizeSettings(raw: Record<string, unknown>): WebServerSettings {
   return {
@@ -184,13 +181,6 @@ function parseSettingsRecord(text: string): Record<string, unknown> {
   return raw;
 }
 
-function freshSettingsRecord(): Record<string, unknown> | null {
-  try {
-    return parseSettingsRecord(readFileSync(settingsPath(), "utf8"));
-  } catch {
-    return null;
-  }
-}
 
 /** Permission reconciliation must use current disk state rather than another process's cached value. */
 export function readWebServerSettingsFromDisk(): WebServerSettings {
@@ -300,39 +290,24 @@ export function saveWebServerSettings(patch: WebServerSettingsPatch): WebServerS
   const toolPoliciesPatch = patch.toolPolicies === undefined ? undefined : parseToolPoliciesPatch(patch.toolPolicies);
   const path = settingsPath();
   mkdirSync(resolve(path, ".."), { recursive: true });
-  const lockPath = settingsLockPath();
-  closeSync(openSync(lockPath, "a", 0o600));
-  chmodSync(lockPath, 0o600);
-  const lock = new DatabaseSync(lockPath);
   const temp = `${path}.tmp-${process.pid}-${Date.now()}`;
-  try {
-    lock.exec("PRAGMA busy_timeout = 5000");
-    lock.exec("BEGIN IMMEDIATE");
-    const current = readWebServerSettingsFromDisk();
-    const settings: WebServerSettings = {
-      autoResumeSessions: patch.autoResumeSessions ?? current.autoResumeSessions,
-      toolPolicies: mergeToolPolicies(current.toolPolicies, toolPoliciesPatch),
-      agentEnv: patch.agentEnv ?? current.agentEnv,
-      browserTransport: patch.browserTransport ?? current.browserTransport,
-      uploadRetentionDays: patch.uploadRetentionDays === undefined ? current.uploadRetentionDays : patch.uploadRetentionDays,
-    };
-    // Grants cannot retain caller-scope provenance, so a narrowing scope revokes
-    // the capability globally. Revoke first: a failure must leave policy unchanged.
-    for (const capability of capabilitiesRequiringRevocation(current.toolPolicies, settings.toolPolicies)) revokeCapability(capability);
-    writeFileSync(temp, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-    renameSync(temp, path);
-    globalThis.__ompWebSettingsCache = { path, settings };
-    lock.exec("COMMIT");
-    return settings;
-  } catch (error) {
-    if (lock.isTransaction) lock.exec("ROLLBACK");
-    throw error;
-  } finally {
+  return withToolPolicyLock(() => {
     try {
-      if (existsSync(temp)) rmSync(temp);
-    } catch {
-      // ignore cleanup failures
+      const current = readWebServerSettingsFromDisk();
+      const settings: WebServerSettings = {
+        autoResumeSessions: patch.autoResumeSessions ?? current.autoResumeSessions,
+        toolPolicies: mergeToolPolicies(current.toolPolicies, toolPoliciesPatch),
+        agentEnv: patch.agentEnv ?? current.agentEnv,
+        browserTransport: patch.browserTransport ?? current.browserTransport,
+        uploadRetentionDays: patch.uploadRetentionDays === undefined ? current.uploadRetentionDays : patch.uploadRetentionDays,
+      };
+      for (const capability of capabilitiesRequiringRevocation(current.toolPolicies, settings.toolPolicies)) revokeCapability(capability);
+      writeFileSync(temp, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      renameSync(temp, path);
+      globalThis.__ompWebSettingsCache = { path, settings };
+      return settings;
+    } finally {
+      if (existsSync(temp)) rmSync(temp, { force: true });
     }
-    lock.close();
-  }
+  });
 }

@@ -1,13 +1,22 @@
 import { createHash } from "node:crypto";
 import { MAX_AGENT_COMMAND_REQUEST_BYTES } from "../image-attachments";
-import { isToolCapabilityAllowed } from "../tool-policy-runtime";
+import { hasToolCapabilityAuthorization } from "../tool-policy-runtime";
 import { fetchSnapshot } from "./api";
 import { diffSnapshot, formatUpdate, splitUpdateEvents, updateEntryId } from "./events";
 import { checkGh, defaultGhRunner, formatTarget, GhUnavailableError, parseGithubTarget, type GhRunner } from "./gh";
-import { advanceCursor, advancePendingBatch, claimPending, closeWatchStore, commitUpdate, getPending, isPosting, listWatches, pendingBatchEntryIds, postedIds, removeSessionWatches, renameSession, type PendingUpdate, type Watch } from "./watch-store";
+import { advanceCursor, advancePendingBatch, claimPending, closeWatchStore, commitUpdate, getPending, isPosting, listWatches, pendingBatchEntryIds, postedIds, removeSessionWatches, removeWatch, renameSession, repoKeyOf, type PendingUpdate, type Watch } from "./watch-store";
 
-const watchingAllowed = (): boolean =>
-  isToolCapabilityAllowed("ompweb.agent_tools") && isToolCapabilityAllowed("github.read_watch");
+const watchAllowed = (watch: Watch): boolean => {
+  const target = parseGithubTarget(watch.itemKey);
+  return hasToolCapabilityAuthorization("github.read_watch", watch.sessionId, "github.repository", repoKeyOf(target), watch.caller);
+};
+const watchingAllowed = (): boolean => {
+  try {
+    return listWatches().some(watchAllowed);
+  } catch {
+    return false;
+  }
+};
 
 /**
  * Server-only poller: every watched item is fetched once per interval (items
@@ -21,7 +30,7 @@ export type Delivery = "ok" | "gone" | "retry" | { rejected: string };
 
 export interface WatcherDeps {
   run?: GhRunner;
-  deliver?: (sessionId: string, entryId: string, message: string) => Promise<Delivery>;
+  deliver?: (sessionId: string, entryId: string, message: string, watch?: Watch) => Promise<Delivery>;
   now?: () => number;
   /** Runs `fn` after `ms`; the returned function cancels it. */
   schedule?: (fn: () => void, ms: number) => () => void;
@@ -70,11 +79,19 @@ declare global {
   var __ompGithubWatcher: WatcherState | undefined;
 }
 
-async function defaultDeliver(sessionId: string, id: string, message: string): Promise<Delivery> {
+async function defaultDeliver(sessionId: string, id: string, message: string, watch?: Watch): Promise<Delivery> {
   try {
+    if (!watch) return "retry";
     // Lazy: message-outbox pulls in rpc-manager, which will load the agent tools that load this module.
     const { runOutboxCommand, outboxScope, GITHUB_WATCH_OUTBOX_OWNER } = await import("../message-outbox");
-    return await deliveryOf(await runOutboxCommand(sessionId, { type: "outbox_add", id, scope: outboxScope(), mode: "prompt", message }, false, GITHUB_WATCH_OUTBOX_OWNER));
+    const target = parseGithubTarget(watch.itemKey);
+    return await deliveryOf(await runOutboxCommand(
+      sessionId,
+      { type: "outbox_add", id, scope: outboxScope(), mode: "prompt", message },
+      false,
+      GITHUB_WATCH_OUTBOX_OWNER,
+      { caller: watch.caller, repository: repoKeyOf(target) },
+    ));
   } catch {
     return "retry";
   }
@@ -85,14 +102,10 @@ const outboxReceipts = () => import("../message-outbox");
 
 /** Reconciles orphaned receipts only after snapshotting the pins, so newly claimed batches are not unpinned. */
 async function reconcileOutboxReceiptPins(): Promise<void> {
-  if (!watchingAllowed()) return;
   const { listOutboxReceiptPins, releaseOutboxReceipt } = await outboxReceipts();
-  if (!watchingAllowed()) return;
   const pins = listOutboxReceiptPins();
-  if (!watchingAllowed()) return;
   const pendingIds = pendingBatchEntryIds();
   for (const { entryId } of pins) {
-    if (!watchingAllowed()) return;
     if (!pendingIds.has(entryId)) releaseOutboxReceipt(entryId);
   }
 }
@@ -120,7 +133,11 @@ const warn = (what: string, error: unknown) => console.warn(`[omp-web] github wa
 async function deliverPending(state: WatcherState, watch: Watch, pending: PendingUpdate): Promise<void> {
   const { sessionId, itemKey, registrationId } = watch;
   while (true) {
-    if (state.stopped || !watchingAllowed()) return;
+    if (state.stopped) return;
+    if (!watchAllowed(watch)) {
+      removeWatch(watch.sessionId, watch.itemKey);
+      return;
+    }
     if (pending.batchIndex === pending.batches.length) {
       commitUpdate(sessionId, itemKey, registrationId, pending.entryId, pending.cursor, pending.final);
       return;
@@ -128,9 +145,17 @@ async function deliverPending(state: WatcherState, watch: Watch, pending: Pendin
     const batch = pending.batches[pending.batchIndex];
     const { pinOutboxReceipt } = await outboxReceipts();
     pinOutboxReceipt(sessionId, batch.entryId);
-    if (state.stopped || !watchingAllowed()) return;
-    const outcome = await state.deps.deliver(sessionId, batch.entryId, batch.message);
     if (state.stopped) return;
+    if (!watchAllowed(watch)) {
+      removeWatch(watch.sessionId, watch.itemKey);
+      return;
+    }
+    const outcome = await state.deps.deliver(sessionId, batch.entryId, batch.message, watch);
+    if (state.stopped) return;
+    if (!watchAllowed(watch)) {
+      removeWatch(watch.sessionId, watch.itemKey);
+      return;
+    }
     if (outcome === "gone") {
       if (watchingAllowed()) removeSessionWatches(sessionId, { itemKey, registrationId, entryId: pending.entryId });
       return;
@@ -166,8 +191,12 @@ async function pollItem(state: WatcherState, itemKey: string): Promise<void> {
   try {
     const watches = listWatches().filter((w) => w.itemKey === itemKey);
     // A stored update is redelivered as it is; only watches without one are diffed anew.
-    const fresh: Watch[] = [];
+    let fresh: Watch[] = [];
     for (const watch of watches) {
+      if (!watchAllowed(watch)) {
+        removeWatch(watch.sessionId, watch.itemKey);
+        continue;
+      }
       const pending = getPending(watch.sessionId, itemKey, watch.registrationId);
       if (pending) await deliverPending(state, watch, pending);
       else fresh.push(watch);
@@ -186,7 +215,9 @@ async function pollItem(state: WatcherState, itemKey: string): Promise<void> {
     let snapshot;
     try {
       await checkGh(state.deps.run, state.deps.now); // gh missing or logged out arrives as GhUnavailableError only through here
-      if (state.stopped || !watchingAllowed()) return;
+      if (state.stopped) return;
+      fresh = fresh.filter(watchAllowed);
+      if (!fresh.length) return;
       snapshot = await fetchSnapshot(state.deps.run, target, since);
     } catch (error) {
       if (error instanceof GhUnavailableError) await announcePaused(state, error.message);
@@ -196,10 +227,14 @@ async function pollItem(state: WatcherState, itemKey: string): Promise<void> {
       }
       return;
     }
-    if (state.stopped || !watchingAllowed()) return;
+    if (state.stopped) return;
+    fresh = fresh.filter(watchAllowed);
+    if (!fresh.length) return;
     state.failing.delete(itemKey);
     await announceResumed(state);
-    if (state.stopped || !watchingAllowed()) return;
+    if (state.stopped) return;
+    fresh = fresh.filter(watchAllowed);
+    if (!fresh.length) return;
     const budget = snapshot.rateLimit;
     if (budget && budget.remaining < BUDGET_FLOOR && state.deps.now() >= (state.budgetResetAt ?? 0)) {
       state.budgetResetAt = Date.parse(budget.resetAt) || state.deps.now() + INTERVAL_MS;
@@ -207,7 +242,7 @@ async function pollItem(state: WatcherState, itemKey: string): Promise<void> {
     }
 
     for (const watch of fresh) {
-      if (state.stopped || !watchingAllowed() || isPosting(itemKey)) return;
+      if (state.stopped || !watchAllowed(watch) || isPosting(itemKey)) return;
       let diff = diffSnapshot(watch.cursor, snapshot, postedIds(itemKey));
       if (!diff.events.length && JSON.stringify(diff.cursor) === JSON.stringify(watch.cursor)) continue;
 
@@ -304,13 +339,13 @@ async function announceResumed(state: WatcherState): Promise<void> {
 const itemsOf = (): string[] => [...new Set(listWatches().map((w) => w.itemKey))];
 
 async function preparePoll(state: WatcherState): Promise<boolean> {
-  if (state.stopped || !watchingAllowed()) return false;
   try {
     await reconcileOutboxReceiptPins();
   } catch (error) {
     warn("outbox receipts could not be reconciled", error);
     return false;
   }
+  if (state.stopped || !watchingAllowed()) return false;
   return !state.stopped && watchingAllowed();
 }
 

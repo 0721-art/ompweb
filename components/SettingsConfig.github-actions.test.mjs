@@ -30,7 +30,9 @@ async function choose(select, name) {
   await settle();
 }
 
-const policies = (dispatch, cancel, rerun) => ({ toolPolicies: { global: {
+const policies = (dispatch, cancel, rerun, agentTools = false, discussions = "ask") => ({ toolPolicies: { global: {
+  "ompweb.agent_tools": { enabled: agentTools, confirmation: agentTools ? "allow" : "ask" },
+  "github.discussions": { enabled: true, confirmation: discussions },
   "github.actions.dispatch": { enabled: dispatch !== "deny", confirmation: dispatch === "allow" ? "allow" : "ask" },
   "github.actions.cancel": { enabled: cancel !== "deny", confirmation: cancel === "allow" ? "allow" : "ask" },
   "github.actions.rerun": { enabled: rerun !== "deny", confirmation: rerun === "allow" ? "allow" : "ask" },
@@ -84,12 +86,14 @@ test("GitHub Actions permissions load as three selects and save only the changed
   await choose(dispatch, "Allow without asking");
   assert.deepEqual(puts.map(({ body }) => body), ['{"toolPolicies":{"global":{"github.actions.dispatch":{"enabled":true,"confirmation":"allow"}}}}']);
   assert.equal(dispatch.disabled, true, "the control stays disabled while its save is in flight");
-  puts[0].resolve(Response.json(policies("allow", "allow", "deny")));
+  puts[0].resolve(Response.json(policies("allow", "allow", "deny", true, "allow")));
   await settle();
   assert.equal(dispatch.disabled, false);
   assert.equal(dispatch.textContent, "Allow without asking");
   assert.equal(page.getByRole("combobox", { name: "Cancel workflow runs" }).textContent, "Allow without asking");
   assert.equal(page.getByRole("combobox", { name: "Rerun workflow runs" }).textContent, "Blocked");
+  assert.equal(page.getByRole("switch", { name: "Agent tools (cross-session)" }).getAttribute("aria-checked"), "true");
+  assert.equal(page.getByRole("switch", { name: "Allow agent GitHub writes without asking" }).getAttribute("aria-checked"), "true");
 });
 
 test("an uncertain GitHub Actions save re-fetches disk state and never presents the unsaved choice as successful", async (t) => {

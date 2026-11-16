@@ -21,7 +21,7 @@ import type { OutboxEntry, OutboxMode } from "./types";
 import { MAX_UPLOADS_PER_MESSAGE, UPLOAD_ID_RE } from "./upload-limits";
 import { snapshotOutboxUploads, UploadError, type OutboxUploadReceipt } from "./uploads";
 import { resolveWebAuthSecret } from "./web-auth-secret";
-import { isToolCapabilityAllowed } from "./tool-policy-runtime";
+import { hasToolCapabilityAuthorization, type ToolCaller } from "./tool-policy-runtime";
 
 /** Delivered (and removed) ids answer a repeated `outbox_add` this long (spec O2: idempotent by id); the browser gives
  * up resending after 7 days, so a resend always finds its id. */
@@ -473,7 +473,13 @@ function confirmedReplacementId(entry: Row, sessionId: string, value: unknown): 
     ? value : undefined;
 }
 /** `outbox_add` / `outbox_remove` for `sessionId`, as runAgentCommand answers them. */
-export async function runOutboxCommand(sessionId: string, command: Record<string, unknown>, advisor: boolean, owner: string): Promise<Response> {
+export async function runOutboxCommand(
+  sessionId: string,
+  command: Record<string, unknown>,
+  advisor: boolean,
+  owner: string,
+  authorization?: { caller?: ToolCaller; repository: string },
+): Promise<Response> {
   if (command.type === "outbox_scope") return Response.json({ success: true, data: { scope: outboxScope() } });
   const scope = outboxScope();
   if (command.type === "outbox_add" && command.scope !== scope) {
@@ -545,7 +551,10 @@ export async function runOutboxCommand(sessionId: string, command: Record<string
         return { kind: "existing", entry: concurrent, ...(confirmsReplacement ? { replaces: confirmsReplacement } : {}) };
       }
       // Host discovery may have awaited while another server disabled the watcher.
-      if (owner === GITHUB_WATCH_OUTBOX_OWNER && (!isToolCapabilityAllowed("ompweb.agent_tools") || !isToolCapabilityAllowed("github.read_watch"))) return { kind: "paused" };
+      if (owner === GITHUB_WATCH_OUTBOX_OWNER && (!authorization
+        || !hasToolCapabilityAuthorization("github.read_watch", sessionId, "github.repository", authorization.repository, authorization.caller))) {
+        return { kind: "paused" };
+      }
       const original = typeof replaces === "string" ? row(replaces) : null;
       const originalMatchesSession = original !== null && entryBelongsToSession(original, sessionId);
       if (original && originalMatchesSession && original.replacement_id) {

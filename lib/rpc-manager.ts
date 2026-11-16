@@ -22,6 +22,7 @@ import {
 } from "./agent-tools";
 import type { AgentToolHost } from "./agent-tool-hosts";
 import { validateToolCaller } from "./tool-policy-runtime";
+import type { CapabilityId } from "./tool-access-policy";
 import { createGithubToolOps, GITHUB_REPLAY_SAFE_TOOLS, GITHUB_TOOL_NAMES } from "./github/tools";
 import { markShuttingDown, recordRunningSessions, resumeOnHostLink, takeInterruptedSessions, type InterruptibleSession } from "./session-resume";
 import { RESUME_PROMPT } from "./hosts/host-resume";
@@ -95,11 +96,14 @@ const IDLE_DESTROY_MS = 10 * 60 * 1000;
  * the idle backstop. Set `OMP_WEB_DISCONNECT_DESTROY_MS=0` to disable reaping
  * and fall back to IDLE_DESTROY_MS alone.
  */
+const AGENT_TOOL_CAPABILITIES: CapabilityId[] = [
+  "ompweb.agent_tools", "ompweb.session_start", "github.read_watch", "github.discussions",
+  "github.actions.dispatch", "github.actions.cancel", "github.actions.rerun",
+];
 function agentToolsAvailable(): boolean {
   const policies = loadWebServerSettings().toolPolicies;
-  if (policies.global["ompweb.agent_tools"]?.enabled) return true;
-  return [...Object.values(policies.agents), ...Object.values(policies.modelRoles)]
-    .some((scope) => scope["ompweb.agent_tools"]?.enabled);
+  return [policies.global, ...Object.values(policies.agents), ...Object.values(policies.modelRoles)]
+    .some((scope) => AGENT_TOOL_CAPABILITIES.some((capability) => scope[capability]?.enabled));
 }
 const DISCONNECT_DESTROY_MS = process.env.OMP_WEB_DISCONNECT_DESTROY_MS !== undefined
   ? Math.max(0, Number(process.env.OMP_WEB_DISCONNECT_DESTROY_MS) || 0)
@@ -3429,10 +3433,13 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
     listHosts: hosts,
 
     async createSession(input, authorize) {
-      const authorizeHost = (host: Host) => {
+      const authorizeHost = async (host: Host) => {
         const configured = this.listHosts().find((candidate) => candidate.id === host.id);
         if (!configured) throw new Error(`Unknown host: ${host.id}`);
-        return authorize(configured);
+        await authorize(configured);
+        const current = this.listHosts().find((candidate) => candidate.id === host.id);
+        if (!current?.agentStartPolicy.enabled) throw new Error(`Target host ${host.id} no longer allows agent starts.`);
+        return true;
       };
       const initialize = async (session: AgentSessionWrapper, preserveUnknownDelivery: boolean) => {
         if (input.provider && input.modelId) {

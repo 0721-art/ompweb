@@ -57,7 +57,7 @@ export async function executeActionTool(name: string, args: Record<string, unkno
     const details = operation === "dispatch" ? `${repository}, workflow ${selectedWorkflow}, ref ${selectedRef}; inputs ${JSON.stringify(inputs)}` : `${args.target}, mode ${args.mode ?? "cancel"}${args.jobId === undefined ? "" : `, job ${args.jobId}`}`;
     const authorize = () => authorizeToolCapability({
       capability,
-      sessionId: ctx.sourceSessionId,
+      sessionId: () => ctx.sourceSessionId,
       resourceType: "github.repository",
       resourceKey: repository.toLowerCase(),
       capabilityLabel: `${operation} GitHub Actions (${details})`,

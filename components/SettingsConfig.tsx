@@ -46,6 +46,9 @@ const globalToolPolicy = (data: unknown, capability: keyof ToolPolicies["global"
   if (!isRecord(policy) || typeof policy.enabled !== "boolean" || (policy.confirmation !== "ask" && policy.confirmation !== "allow")) return null;
   return { enabled: policy.enabled, confirmation: policy.confirmation };
 };
+const TOOL_POLICIES_SAVED_EVENT = "omp-web:tool-policies-saved";
+const publishToolPolicies = (data: unknown) => window.dispatchEvent(new CustomEvent(TOOL_POLICIES_SAVED_EVENT, { detail: data }));
+
 const SettingsTabLoading = () => {
   const { t } = useI18n();
   return <div role="status" style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: "var(--text-sm)" }}>{t("settingsConfig.loadingSettings")}</div>;
@@ -327,11 +330,16 @@ function AgentToolsSetting() {
   const [enabled, setEnabled] = useState<boolean | null>(null);
   useEffect(() => {
     let alive = true;
+    const apply = (data: unknown) => {
+      if (alive) setEnabled(globalToolPolicy(data, "ompweb.agent_tools")?.enabled ?? false);
+    };
+    const saved = (event: Event) => apply((event as CustomEvent).detail);
+    window.addEventListener(TOOL_POLICIES_SAVED_EVENT, saved);
     fetch("/api/web-settings")
       .then((res) => (res.ok ? res.json() : null))
-      .then((data: unknown) => { if (alive) setEnabled(globalToolPolicy(data, "ompweb.agent_tools")?.enabled ?? false); })
+      .then((data: unknown) => { apply(data); if (data) publishToolPolicies(data); })
       .catch(() => { if (alive) setEnabled(false); });
-    return () => { alive = false; };
+    return () => { alive = false; window.removeEventListener(TOOL_POLICIES_SAVED_EVENT, saved); };
   }, []);
   const change = async (next: boolean) => {
     const previous = enabled;
@@ -343,6 +351,7 @@ function AgentToolsSetting() {
         body: JSON.stringify({ toolPolicies: { global: { "ompweb.agent_tools": { enabled: next, confirmation: next ? "allow" : "ask" } } } }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      publishToolPolicies(await res.json());
     } catch (error) {
       setEnabled(previous);
       toast.error(t("settingsConfig.agentToolsSaveFailed"), error instanceof Error ? error.message : String(error));
@@ -365,7 +374,9 @@ function GithubWritesSetting() {
     try {
       const res = await fetch("/api/web-settings");
       if (!res.ok) return null;
-      const policy = globalToolPolicy(await res.json(), "github.discussions");
+      const data: unknown = await res.json();
+      publishToolPolicies(data);
+      const policy = globalToolPolicy(data, "github.discussions");
       return policy ? policy.enabled && policy.confirmation === "allow" : null;
     } catch {
       return null;
@@ -373,8 +384,13 @@ function GithubWritesSetting() {
   }, []);
   useEffect(() => {
     let alive = true;
+    const saved = (event: Event) => {
+      const policy = globalToolPolicy((event as CustomEvent).detail, "github.discussions");
+      if (alive && policy) setEnabled(policy.enabled && policy.confirmation === "allow");
+    };
+    window.addEventListener(TOOL_POLICIES_SAVED_EVENT, saved);
     void load().then((value) => { if (alive) setEnabled(value); });
-    return () => { alive = false; };
+    return () => { alive = false; window.removeEventListener(TOOL_POLICIES_SAVED_EVENT, saved); };
   }, [load]);
   const change = async (next: boolean) => {
     setEnabled(next);
@@ -386,6 +402,7 @@ function GithubWritesSetting() {
         body: JSON.stringify({ toolPolicies: { global: { "github.discussions": { enabled: true, confirmation: next ? "allow" : "ask" } } } }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      publishToolPolicies(await res.json());
     } catch (error) {
       setEnabled(null);
       toast.error(t("settingsConfig.githubWritesUnaskedSaveFailed"), error instanceof Error ? error.message : String(error));
@@ -412,6 +429,7 @@ function GithubActionsPermissionsSetting() {
       const res = response ?? await fetch("/api/web-settings");
       if (!res.ok) return null;
       const data: unknown = await res.json();
+      publishToolPolicies(data);
       const policies = GITHUB_ACTIONS_OPERATIONS.map((operation) => [operation, globalToolPolicy(data, `github.actions.${operation}`)] as const);
       if (policies.some(([, policy]) => !policy)) return null;
       return Object.fromEntries(policies.map(([operation, policy]) => [
@@ -424,8 +442,17 @@ function GithubActionsPermissionsSetting() {
   }, []);
   useEffect(() => {
     let alive = true;
+    const saved = (event: Event) => {
+      const data = (event as CustomEvent).detail;
+      const next = Object.fromEntries(GITHUB_ACTIONS_OPERATIONS.map((operation) => {
+        const policy = globalToolPolicy(data, `github.actions.${operation}`);
+        return [operation, !policy?.enabled ? "deny" : policy.confirmation];
+      })) as GithubActionsPermissions;
+      if (alive) setPermissions(next);
+    };
+    window.addEventListener(TOOL_POLICIES_SAVED_EVENT, saved);
     void load().then((value) => { if (alive) setPermissions(value); });
-    return () => { alive = false; };
+    return () => { alive = false; window.removeEventListener(TOOL_POLICIES_SAVED_EVENT, saved); };
   }, [load]);
   const change = async (operation: GithubActionsOperation, next: GithubActionsPermission) => {
     if (!permissions) return;

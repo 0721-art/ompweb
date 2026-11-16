@@ -3,6 +3,7 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "../omp/paths";
+import { revokeToolApprovalResource } from "../tool-approval-revoke";
 import type { OperationPolicy } from "../tool-access-policy";
 
 export interface HostRecord {
@@ -39,6 +40,7 @@ function normalizeLabel(label: string): string {
 const sha256Hex = (token: string): string => createHash("sha256").update(token).digest("hex");
 const ASK: OperationPolicy = { enabled: true, confirmation: "ask" };
 const ALLOW: OperationPolicy = { enabled: true, confirmation: "allow" };
+const DENY: OperationPolicy = { enabled: false, confirmation: "ask" };
 
 function operationPolicy(value: unknown): OperationPolicy | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -58,7 +60,9 @@ function parseHostRecord(raw: unknown): HostRecord | null {
     tokenHash: r.tokenHash,
     createdAt: typeof r.createdAt === "string" ? r.createdAt : "",
     lastSeenAt: typeof r.lastSeenAt === "string" ? r.lastSeenAt : null,
-    agentStartPolicy: operationPolicy(r.agentStartPolicy) ?? (r.allowAgentStart === true ? ALLOW : ASK),
+    agentStartPolicy: Object.hasOwn(r, "agentStartPolicy")
+      ? operationPolicy(r.agentStartPolicy) ?? DENY
+      : r.allowAgentStart === true ? ALLOW : ASK,
     shareCredentials: r.shareCredentials === true,
   };
 }
@@ -152,6 +156,9 @@ export function updateHost(id: string, updates: { label?: string; agentStartPoli
   if (updates.agentStartPolicy !== undefined) {
     const policy = operationPolicy(updates.agentStartPolicy);
     if (!policy) throw new Error("Invalid agent-start policy");
+    if (!policy.enabled || (host.agentStartPolicy.confirmation === "allow" && policy.confirmation === "ask")) {
+      revokeToolApprovalResource("host", id, "ompweb.session_start");
+    }
     host.agentStartPolicy = policy;
   }
   if (updates.shareCredentials !== undefined) host.shareCredentials = updates.shareCredentials;
