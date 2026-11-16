@@ -1890,7 +1890,11 @@ function readOutboxForSend(db: IDBDatabase | null): Promise<LocalOutboxEntry[] |
 /** What an earlier worker (or tab) left: every unsent entry goes again. */
 async function loadOutbox(db: IDBDatabase | null): Promise<boolean> {
   const stored = await readOutbox(db);
-  if (!stored) return false;
+  if (!stored) {
+    outboxPartial = true;
+    recordOutbox("read", { id: "", sessionId: "", mode: "prompt" }, { error: "IndexedDB read failed" });
+    return false;
+  }
   for (const entry of stored) outboxItems.set(entry.id, { entry, inFlight: false, retryTimer: undefined, retryMs: RECONNECT_MIN_MS });
   await Promise.all([...new Set(stored.map((entry) => entry.sessionId))].map((sessionId) => sendOutbox(sessionId)));
   return true;
@@ -2186,9 +2190,10 @@ async function outboxAnswer(item: OutboxItem, status: number, body: unknown): Pr
   if (outboxItems.get(id) !== item) return;
   const reply = (body ?? {}) as { error?: unknown };
   const detail = typeof reply.error === "string" ? reply.error : undefined;
-  recordOutbox("response", item.entry, { status, ...(detail ? { error: detail } : {}) });
+  const httpStatus = status;
+  recordOutbox("response", item.entry, { status: httpStatus, ...(detail ? { error: detail } : {}) });
   const accepted = acceptedOutboxEntry(body, id);
-  if (status >= 200 && status < 300 && !accepted) status = 0;
+  if (httpStatus >= 200 && httpStatus < 300 && !accepted) status = 0;
   if (status >= 200 && status < 300) {
     // Commit the accepted ID and only server-confirmed or locally proven retry lineage together.
     const confirmedReplaces = isRecord(accepted) && typeof accepted.replaces === "string" && accepted.replaces === replaces
@@ -2248,7 +2253,7 @@ async function outboxAnswer(item: OutboxItem, status: number, body: unknown): Pr
       sendOutbox(sessionId);
     }, item.retryMs);
     item.retryMs = Math.min(item.retryMs * 2, RECONNECT_MAX_MS);
-    recordOutbox("retry", item.entry, { status, error: detail ?? `HTTP ${status}` });
+    recordOutbox("retry", item.entry, { status: httpStatus, error: httpStatus >= 200 && httpStatus < 300 ? "Invalid acceptance receipt" : detail ?? `HTTP ${httpStatus}` });
     return;
   } else {
     return failOutbox(item, typeof reply.error === "string" ? reply.error : `HTTP ${status}`);
