@@ -102,3 +102,17 @@ Final verification:
 - `bun test --parallel --timeout 30000 lib/tool-policy-runtime.test.mjs lib/github/watcher.test.mjs lib/message-outbox.test.mjs lib/hosts/hub-v7.test.mjs lib/agent-tools.test.mjs lib/rpc-manager.test.mjs components/SettingsConfig.github-actions.test.mjs components/SettingsConfig.github-writes.test.mjs` — 359 pass, 0 fail.
 - `npm run typecheck` — pass.
 - `npx eslint components/SettingsConfig.tsx components/SettingsConfig.github-actions.test.mjs lib/agent-command.ts lib/github/watcher.ts lib/hosts/host.ts lib/hosts/hub.ts lib/hosts/hub-v7.test.mjs lib/hosts/local-host.ts lib/message-outbox.test.mjs lib/message-outbox.ts lib/rpc-manager.ts lib/tool-policy-runtime.ts` — pass.
+
+## Task 4D: fresh-session reset authorization boundary
+
+- Reused the existing startup authorizer immediately after the awaited `sessionFileExists` lookup and immediately before the native `new_session` send. Cancellation or policy revocation during the lookup now aborts startup without sending the session mutation; no policy API or alternate authorization path was added.
+- Added a deterministic deferred-lookup regression that revokes authorization while the lookup is pending and asserts startup rejects without a native `new_session`.
+- Preserved the existing startup error disposal and delivery-outcome behavior by allowing the authorizer rejection to follow the existing failure path.
+
+Task 4D verification:
+
+- RED: `bun test --timeout 30000 lib/rpc-manager.test.mjs --test-name-pattern 'revocation during a fresh-session file lookup'` — failed with `Missing expected rejection`.
+- GREEN: the same focused command — 1 pass, 158 filtered, 0 fail.
+- `bun test --timeout 30000 lib/rpc-manager.test.mjs` — 159 pass, 0 fail.
+- `npm run typecheck` — pass.
+- `npx eslint lib/rpc-manager.ts lib/rpc-manager.test.mjs` — pass.

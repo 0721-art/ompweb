@@ -3738,6 +3738,7 @@ export async function startRpcSession(
       // a path it has not created yet (session files are written lazily on the
       // first message), so this never fires for a real new session.
       if (!sessionFile && created.sessionFile && await host.sessionFileExists(created.sessionFile)) {
+        await authorize?.();
         await created.send({ type: "new_session" });
       }
       // Register server agent tools (#275) at startup when the gate is on,
