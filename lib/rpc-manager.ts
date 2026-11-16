@@ -542,11 +542,15 @@ export class AgentSessionWrapper {
       caller?: ToolCaller;
       authorization: DeferredToolAuthorization;
       generation: number;
+      approvalGeneration: number;
+      approvalClearGeneration: number;
       claim?: {
         claimId: string;
         token: string;
         sessionId: string;
         generation: number;
+        approvalGeneration: number;
+        approvalClearGeneration: number;
         rememberOnSuccess: boolean;
         expiresAt: number;
         timer: NodeJS.Timeout;
@@ -1426,6 +1430,8 @@ export class AgentSessionWrapper {
             caller?: ToolCaller;
             authorization: DeferredToolAuthorization;
             generation: number;
+            approvalGeneration: number;
+            approvalClearGeneration: number;
           } | undefined;
           if (toolName === "open_url") {
             try {
@@ -1687,11 +1693,37 @@ export class AgentSessionWrapper {
     clearTimeout(pending.openUrl?.claim?.timer);
   }
 
+  private settleClaimedOpenUrlUnknown(
+    id: string,
+    pending: { crossSessionId?: string; openUrl?: { claim?: { timer: NodeJS.Timeout } } },
+  ): boolean {
+    if (!pending.openUrl?.claim || this.pendingHostTools.get(id) !== pending) return false;
+    this.clearOpenUrlClaimTimer(pending);
+    this.pendingHostTools.delete(id);
+    this.unparkHostTool(id);
+    const withdrawal = { type: "host_tool_cancel" as const, targetId: id };
+    this.emit(withdrawal);
+    if (pending.crossSessionId !== undefined) {
+      for (const listener of getHostToolListeners()) {
+        try { listener({ ...withdrawal, sessionId: pending.crossSessionId }); } catch { /* isolate listeners */ }
+      }
+    }
+    this.proc.sendFrame({
+      type: "host_tool_result",
+      id,
+      isError: true,
+      result: { content: [{ type: "text", text: unknownOutcome("open_url") }] },
+    });
+    notifyRunningChange();
+    return true;
+  }
+
 
   /** Withdraw the browser operation using the identity under which it was delivered. */
   private cancelPendingHostTool(id: string): boolean {
     const pending = this.pendingHostTools.get(id);
     if (!pending) return false;
+    if (this.settleClaimedOpenUrlUnknown(id, pending)) return true;
     this.clearOpenUrlClaimTimer(pending);
     this.pendingHostTools.delete(id);
     this.unparkHostTool(id);
@@ -1715,6 +1747,7 @@ export class AgentSessionWrapper {
       if ((which === "own" && cross) || (which === "cross" && !cross)) continue;
       // No tab ever received it: its own deadline settles it (see parkHostTool).
       if (which === "own" && this.parkedHostTools.has(id)) continue;
+      if (this.settleClaimedOpenUrlUnknown(id, pending)) continue;
       this.cancelPendingHostTool(id);
       this.proc.sendFrame({
         type: "host_tool_result",
@@ -1739,6 +1772,8 @@ export class AgentSessionWrapper {
       caller?: ToolCaller;
       authorization: DeferredToolAuthorization;
       generation: number;
+      approvalGeneration: number;
+      approvalClearGeneration: number;
     },
   ): void {
     this.pendingHostTools.set(id, { event, openUrl });
@@ -3069,29 +3104,15 @@ export class AgentSessionWrapper {
             resourceType: "url.origin",
             resourceKey: pending.openUrl.origin,
             caller: pending.openUrl.caller,
-          }, pending.openUrl.generation, pending.openUrl.authorization === "confirmation_required",
+          }, pending.openUrl.generation, pending.openUrl.approvalGeneration, pending.openUrl.approvalClearGeneration,
+          pending.openUrl.authorization === "confirmation_required",
           () => this.pendingHostTools.get(id) === pending && !pending.openUrl?.claim);
           const token = randomUUID();
           const expiresAt = Date.now() + OPEN_URL_CLAIM_TTL_MS;
           const timer = setTimeout(() => {
             const current = this.pendingHostTools.get(id);
             if (current !== pending || current.openUrl?.claim?.token !== token) return;
-            this.pendingHostTools.delete(id);
-            this.unparkHostTool(id);
-            const withdrawal = { type: "host_tool_cancel" as const, targetId: id };
-            this.emit(withdrawal);
-            if (pending.crossSessionId !== undefined) {
-              for (const listener of getHostToolListeners()) {
-                try { listener({ ...withdrawal, sessionId: pending.crossSessionId }); } catch { /* isolate listeners */ }
-              }
-            }
-            this.proc.sendFrame({
-              type: "host_tool_result",
-              id,
-              isError: true,
-              result: { content: [{ type: "text", text: unknownOutcome("open_url") }] },
-            });
-            notifyRunningChange();
+            this.settleClaimedOpenUrlUnknown(id, pending);
           }, OPEN_URL_CLAIM_TTL_MS);
           timer.unref?.();
           pending.openUrl.claim = {
@@ -3099,6 +3120,8 @@ export class AgentSessionWrapper {
             token,
             sessionId: claimed.sessionId,
             generation: claimed.generation,
+            approvalGeneration: claimed.approvalGeneration,
+            approvalClearGeneration: claimed.approvalClearGeneration,
             rememberOnSuccess: claimed.rememberOnSuccess,
             expiresAt,
             timer,
@@ -3129,11 +3152,8 @@ export class AgentSessionWrapper {
           if (claim) {
             if (token !== claim.token) throw new Error("The browser URL claim token is invalid.");
             if (Date.now() > claim.expiresAt) {
-              this.pendingHostTools.delete(id);
-              this.unparkHostTool(id);
-              const error = new Error("The browser URL claim token expired.");
-              this.rejectBrowserOpenUrl(pending.event, error);
-              throw error;
+              this.settleClaimedOpenUrlUnknown(id, pending);
+              throw new Error("The browser URL claim expired with an unknown outcome; do not retry automatically.");
             }
             if (command.isError !== true) {
               const currentSessionId = this.sessionId;
@@ -3148,7 +3168,7 @@ export class AgentSessionWrapper {
                   resourceType: "url.origin",
                   resourceKey: pending.openUrl.origin,
                   caller: pending.openUrl.caller,
-                }, currentSessionId, claim.generation,
+                }, currentSessionId, claim.sessionId, claim.generation, claim.approvalGeneration, claim.approvalClearGeneration,
                 () => this.pendingHostTools.get(id) === pending && pending.openUrl?.claim === claim);
               }
             }

@@ -1,7 +1,7 @@
 import { grant, has } from "./tool-approval-store";
 import { resolveToolPolicy, type CapabilityId, type OperationPolicy } from "./tool-access-policy";
 import { readWebServerSettingsFromDisk } from "./web-settings";
-import { readToolPolicyGeneration, withToolPolicyLock } from "./tool-policy-lock";
+import { readToolApprovalClearGeneration, readToolApprovalGeneration, readToolPolicyGeneration, withToolPolicyLock } from "./tool-policy-lock";
 
 export interface ToolCaller {
   agentId?: string;
@@ -25,6 +25,8 @@ export type DeferredToolAuthorization = "authorized" | "confirmation_required";
 export interface DeferredToolAuthorizationResolution {
   authorization: DeferredToolAuthorization;
   generation: number;
+  approvalGeneration: number;
+  approvalClearGeneration: number;
 }
 
 const SCOPE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -108,15 +110,19 @@ export function resolveDeferredToolAuthorization(input: DeferredToolAuthorizatio
     if (policy.target?.enabled === false) throw new Error(`The target ${input.resourceKey ?? "resource"} denies ${input.capabilityLabel}.`);
     if (!policy.allowed) throw new Error(`${input.capabilityLabel} is disabled by tool policy.`);
     const generation = readToolPolicyGeneration(lock, input.capability);
-    if (policy.caller.confirmation === "allow" && policy.target?.confirmation !== "ask") {
-      return { authorization: "authorized", generation };
-    }
     const sessionId = currentSessionId(authorization);
+    const approvalGeneration = input.resourceType !== undefined && input.resourceKey !== undefined
+      ? readToolApprovalGeneration(lock, sessionId, input.resourceType, input.resourceKey, input.capability)
+      : 0;
+    const approvalClearGeneration = readToolApprovalClearGeneration(lock);
+    if (policy.caller.confirmation === "allow" && policy.target?.confirmation !== "ask") {
+      return { authorization: "authorized", generation, approvalGeneration, approvalClearGeneration };
+    }
     const state = input.capability !== "omp.bash" && input.resourceType !== undefined && input.resourceKey !== undefined
       && has(sessionId, input.resourceType, input.resourceKey, input.capability)
       ? "authorized"
       : "confirmation_required";
-    return { authorization: state, generation };
+    return { authorization: state, generation, approvalGeneration, approvalClearGeneration };
   });
 }
 
@@ -124,9 +130,11 @@ export function resolveDeferredToolAuthorization(input: DeferredToolAuthorizatio
 export function claimDeferredToolAuthorization(
   input: DeferredToolAuthorizationInput,
   expectedGeneration: number,
+  expectedApprovalGeneration: number,
+  expectedApprovalClearGeneration: number,
   userConfirmed: boolean,
   isPending: () => boolean,
-): { sessionId: string; generation: number; rememberOnSuccess: boolean } {
+): { sessionId: string; generation: number; approvalGeneration: number; approvalClearGeneration: number; rememberOnSuccess: boolean } {
   validateToolCaller(input.caller);
   return withToolPolicyLock((lock) => {
     if (!isPending()) throw new Error("The tool request is no longer pending.");
@@ -138,21 +146,31 @@ export function claimDeferredToolAuthorization(
     if (current.target?.enabled === false) throw new Error(`The target ${input.resourceKey ?? "resource"} denies ${input.capabilityLabel}.`);
     if (!current.allowed) throw new Error(`${input.capabilityLabel} is disabled by tool policy.`);
     const sessionId = currentSessionId(authorization);
+    const approvalGeneration = input.resourceType !== undefined && input.resourceKey !== undefined
+      ? readToolApprovalGeneration(lock, sessionId, input.resourceType, input.resourceKey, input.capability)
+      : 0;
+    const approvalClearGeneration = readToolApprovalClearGeneration(lock);
+    if (approvalGeneration !== expectedApprovalGeneration || approvalClearGeneration !== expectedApprovalClearGeneration) {
+      throw new Error("The remembered browser URL approvals changed before execution was claimed.");
+    }
     const hasGrant = input.resourceType !== undefined && input.resourceKey !== undefined
       && has(sessionId, input.resourceType, input.resourceKey, input.capability);
     const confirmationRequired = current.caller.confirmation === "ask" || current.target?.confirmation === "ask";
     if (!userConfirmed && confirmationRequired && !hasGrant) {
       throw new Error("The browser URL authorization changed before execution was claimed.");
     }
-    return { sessionId, generation, rememberOnSuccess: userConfirmed && confirmationRequired && !hasGrant };
+    return { sessionId, generation, approvalGeneration, approvalClearGeneration, rememberOnSuccess: userConfirmed && confirmationRequired && !hasGrant };
   });
 }
 
 /** Persist a remembered grant only after the claimed browser action actually succeeds. */
 export function promoteClaimedToolApproval(
   input: DeferredToolAuthorizationInput,
-  claimedSessionId: string,
+  grantSessionId: string,
+  approvalSessionId: string,
   expectedGeneration: number,
+  expectedApprovalGeneration: number,
+  expectedApprovalClearGeneration: number,
   isPending: () => boolean,
 ): void {
   withToolPolicyLock((lock) => {
@@ -160,10 +178,12 @@ export function promoteClaimedToolApproval(
       throw new Error("The browser URL claim is no longer pending.");
     }
     if (readToolPolicyGeneration(lock, input.capability) !== expectedGeneration) return;
+    if (readToolApprovalGeneration(lock, approvalSessionId, input.resourceType, input.resourceKey, input.capability) !== expectedApprovalGeneration
+      || readToolApprovalClearGeneration(lock) !== expectedApprovalClearGeneration) return;
     const current = resolved(deferredInput(input));
     const confirmationRequired = current.allowed
       && (current.caller.confirmation === "ask" || current.target?.confirmation === "ask");
-    if (confirmationRequired) grant(claimedSessionId, input.resourceType, input.resourceKey, input.capability);
+    if (confirmationRequired) grant(grantSessionId, input.resourceType, input.resourceKey, input.capability);
   });
 }
 

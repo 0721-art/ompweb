@@ -7,6 +7,7 @@ import test from "node:test";
 const store = await import("../../../lib/tool-approval-store.ts");
 const route = await import("./route.ts");
 const { ROUTE_MODULES } = await import("../../../server/routes.ts");
+const { currentToolPolicyGeneration } = await import("../../../lib/tool-policy-lock.ts");
 
 function isolated(t) {
   const dir = mkdtempSync(join(tmpdir(), "omp-tool-approval-route-"));
@@ -56,6 +57,24 @@ test("DELETE validates exact request shapes and supports explicit clear-all", as
   const cleared = await route.DELETE(request({ all: true }));
   assert.equal(cleared.status, 200);
   assert.deepEqual(await cleared.json(), { cleared: 1 });
+});
+
+test("revoke and clear invalidate approval instances without narrowing unrelated watch policy", async (t) => {
+  isolated(t);
+  const a = { sessionId: "session-a", resourceType: "github.repository", resourceKey: "acme/widgets", capability: "github.read_watch" };
+  const b = { ...a, sessionId: "session-b", resourceKey: "acme/other" };
+  store.grant(a.sessionId, a.resourceType, a.resourceKey, a.capability);
+  store.grant(b.sessionId, b.resourceType, b.resourceKey, b.capability);
+  const generation = currentToolPolicyGeneration("github.read_watch");
+
+  assert.equal((await route.DELETE(request(a))).status, 200);
+  assert.equal(store.has(a.sessionId, a.resourceType, a.resourceKey, a.capability), false);
+  assert.equal(store.has(b.sessionId, b.resourceType, b.resourceKey, b.capability), true, "a second session/repository watch remains authorized");
+  assert.equal(currentToolPolicyGeneration("github.read_watch"), generation, "grant revoke is not a capability-wide policy narrowing");
+
+  assert.equal((await route.DELETE(request({ all: true }))).status, 200);
+  assert.equal(store.has(b.sessionId, b.resourceType, b.resourceKey, b.capability), false);
+  assert.equal(currentToolPolicyGeneration("github.read_watch"), generation, "clear-all does not invalidate unrelated durable watch policy generations");
 });
 
 test("DELETE rejects malformed JSON", async () => {

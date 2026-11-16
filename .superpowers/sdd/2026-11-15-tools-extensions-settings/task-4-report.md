@@ -168,3 +168,16 @@ Fix-round 2 verification:
 - `bun test --timeout 30000 lib/tool-policy-runtime.test.mjs lib/tool-approval-store.test.mjs app/api/tool-approvals/route.test.mjs lib/event-stream-protocol.test.mjs lib/browser-link.test.mjs lib/agent-client.test.mjs` — 74 pass, 0 fail.
 - `npm run typecheck` — pass.
 - Scoped ESLint — 0 errors; 5 pre-existing `react-hooks/exhaustive-deps` warnings in `components/AppShell.tsx`.
+
+## Task 4B fix round 3: unknown outcomes and scoped revocation
+
+- Unified every claimed-but-unsettled termination through one claim-qualified unknown-outcome path. Overdue results, expiry, browser disconnect, native cancellation and restart withdraw the exact claim, report that execution may have occurred, prohibit automatic retry, and never create a grant.
+- Replaced capability-wide generation bumps for approval revoke/clear with approval-instance generations plus a dedicated clear generation under the existing lock. Per-grant revoke invalidates only its exact session/resource/capability promotion; clear invalidates pending promotions without touching policy generations or unrelated durable GitHub watches.
+- Added deterministic overdue-before-timer and post-open disconnect coverage plus a second-session/repository regression proving revoke and clear leave `github.read_watch` policy generation unchanged.
+
+Fix-round 3 verification:
+
+- `bun test --timeout 30000 lib/rpc-manager.test.mjs` — 163 pass, 0 fail.
+- `bun test --timeout 30000 app/api/tool-approvals/route.test.mjs lib/tool-policy-runtime.test.mjs lib/tool-approval-store.test.mjs lib/github/watcher.test.mjs` — 49 pass, 0 fail.
+- `npm run typecheck` — pass.
+- Scoped ESLint — pass.
