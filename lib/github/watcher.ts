@@ -1,10 +1,13 @@
 import { createHash } from "node:crypto";
 import { MAX_AGENT_COMMAND_REQUEST_BYTES } from "../image-attachments";
-import { readAgentToolsEnabledFromDisk } from "../web-settings";
+import { isToolCapabilityAllowed } from "../tool-policy-runtime";
 import { fetchSnapshot } from "./api";
 import { diffSnapshot, formatUpdate, splitUpdateEvents, updateEntryId } from "./events";
 import { checkGh, defaultGhRunner, formatTarget, GhUnavailableError, parseGithubTarget, type GhRunner } from "./gh";
 import { advanceCursor, advancePendingBatch, claimPending, closeWatchStore, commitUpdate, getPending, isPosting, listWatches, pendingBatchEntryIds, postedIds, removeSessionWatches, renameSession, type PendingUpdate, type Watch } from "./watch-store";
+
+const watchingAllowed = (): boolean =>
+  isToolCapabilityAllowed("ompweb.agent_tools") && isToolCapabilityAllowed("github.read_watch");
 
 /**
  * Server-only poller: every watched item is fetched once per interval (items
@@ -82,14 +85,14 @@ const outboxReceipts = () => import("../message-outbox");
 
 /** Reconciles orphaned receipts only after snapshotting the pins, so newly claimed batches are not unpinned. */
 async function reconcileOutboxReceiptPins(): Promise<void> {
-  if (!readAgentToolsEnabledFromDisk()) return;
+  if (!watchingAllowed()) return;
   const { listOutboxReceiptPins, releaseOutboxReceipt } = await outboxReceipts();
-  if (!readAgentToolsEnabledFromDisk()) return;
+  if (!watchingAllowed()) return;
   const pins = listOutboxReceiptPins();
-  if (!readAgentToolsEnabledFromDisk()) return;
+  if (!watchingAllowed()) return;
   const pendingIds = pendingBatchEntryIds();
   for (const { entryId } of pins) {
-    if (!readAgentToolsEnabledFromDisk()) return;
+    if (!watchingAllowed()) return;
     if (!pendingIds.has(entryId)) releaseOutboxReceipt(entryId);
   }
 }
@@ -117,7 +120,7 @@ const warn = (what: string, error: unknown) => console.warn(`[omp-web] github wa
 async function deliverPending(state: WatcherState, watch: Watch, pending: PendingUpdate): Promise<void> {
   const { sessionId, itemKey, registrationId } = watch;
   while (true) {
-    if (state.stopped || !readAgentToolsEnabledFromDisk()) return;
+    if (state.stopped || !watchingAllowed()) return;
     if (pending.batchIndex === pending.batches.length) {
       commitUpdate(sessionId, itemKey, registrationId, pending.entryId, pending.cursor, pending.final);
       return;
@@ -125,11 +128,11 @@ async function deliverPending(state: WatcherState, watch: Watch, pending: Pendin
     const batch = pending.batches[pending.batchIndex];
     const { pinOutboxReceipt } = await outboxReceipts();
     pinOutboxReceipt(sessionId, batch.entryId);
-    if (state.stopped || !readAgentToolsEnabledFromDisk()) return;
+    if (state.stopped || !watchingAllowed()) return;
     const outcome = await state.deps.deliver(sessionId, batch.entryId, batch.message);
     if (state.stopped) return;
     if (outcome === "gone") {
-      if (readAgentToolsEnabledFromDisk()) removeSessionWatches(sessionId, { itemKey, registrationId, entryId: pending.entryId });
+      if (watchingAllowed()) removeSessionWatches(sessionId, { itemKey, registrationId, entryId: pending.entryId });
       return;
     }
     if (outcome === "retry") return;
@@ -158,7 +161,7 @@ async function deliverPending(state: WatcherState, watch: Watch, pending: Pendin
   }
 }
 async function pollItem(state: WatcherState, itemKey: string): Promise<void> {
-  if (state.stopped || !readAgentToolsEnabledFromDisk() || state.inFlight.has(itemKey)) return;
+  if (state.stopped || !watchingAllowed() || state.inFlight.has(itemKey)) return;
   state.inFlight.add(itemKey);
   try {
     const watches = listWatches().filter((w) => w.itemKey === itemKey);
@@ -169,7 +172,7 @@ async function pollItem(state: WatcherState, itemKey: string): Promise<void> {
       if (pending) await deliverPending(state, watch, pending);
       else fresh.push(watch);
     }
-    if (state.stopped || !readAgentToolsEnabledFromDisk()) return;
+    if (state.stopped || !watchingAllowed()) return;
     if (!fresh.length) return;
     if (isPosting(itemKey)) return;
     // A low GraphQL budget waits for its reset; stored updates above cost no GitHub call.
@@ -183,7 +186,7 @@ async function pollItem(state: WatcherState, itemKey: string): Promise<void> {
     let snapshot;
     try {
       await checkGh(state.deps.run, state.deps.now); // gh missing or logged out arrives as GhUnavailableError only through here
-      if (state.stopped || !readAgentToolsEnabledFromDisk()) return;
+      if (state.stopped || !watchingAllowed()) return;
       snapshot = await fetchSnapshot(state.deps.run, target, since);
     } catch (error) {
       if (error instanceof GhUnavailableError) await announcePaused(state, error.message);
@@ -193,10 +196,10 @@ async function pollItem(state: WatcherState, itemKey: string): Promise<void> {
       }
       return;
     }
-    if (state.stopped || !readAgentToolsEnabledFromDisk()) return;
+    if (state.stopped || !watchingAllowed()) return;
     state.failing.delete(itemKey);
     await announceResumed(state);
-    if (state.stopped || !readAgentToolsEnabledFromDisk()) return;
+    if (state.stopped || !watchingAllowed()) return;
     const budget = snapshot.rateLimit;
     if (budget && budget.remaining < BUDGET_FLOOR && state.deps.now() >= (state.budgetResetAt ?? 0)) {
       state.budgetResetAt = Date.parse(budget.resetAt) || state.deps.now() + INTERVAL_MS;
@@ -204,12 +207,12 @@ async function pollItem(state: WatcherState, itemKey: string): Promise<void> {
     }
 
     for (const watch of fresh) {
-      if (state.stopped || !readAgentToolsEnabledFromDisk() || isPosting(itemKey)) return;
+      if (state.stopped || !watchingAllowed() || isPosting(itemKey)) return;
       let diff = diffSnapshot(watch.cursor, snapshot, postedIds(itemKey));
       if (!diff.events.length && JSON.stringify(diff.cursor) === JSON.stringify(watch.cursor)) continue;
 
       // Re-read shared post state immediately before mutating this watch; the SQL guards repeat it atomically.
-      if (state.stopped || !readAgentToolsEnabledFromDisk() || isPosting(itemKey)) return;
+      if (state.stopped || !watchingAllowed() || isPosting(itemKey)) return;
       diff = diffSnapshot(watch.cursor, snapshot, postedIds(itemKey));
       if (!diff.events.length) {
         advanceCursor(watch.sessionId, itemKey, watch.registrationId, watch.cursor, diff.cursor);
@@ -247,7 +250,7 @@ async function pollItem(state: WatcherState, itemKey: string): Promise<void> {
         batches,
         batchIndex: 0,
       };
-      if (state.stopped || !readAgentToolsEnabledFromDisk() || isPosting(itemKey)) return;
+      if (state.stopped || !watchingAllowed() || isPosting(itemKey)) return;
       const eventIds = events.flatMap((event) => {
         if (event.kind === "review" && event.databaseId !== undefined) return [event.id, `review:${event.databaseId}`];
         return [event.id];
@@ -262,10 +265,10 @@ async function pollItem(state: WatcherState, itemKey: string): Promise<void> {
   }
 }
 async function notify(state: WatcherState, sessionId: string, kind: "paused" | "resumed", minute: number, text: string): Promise<boolean> {
-  if (state.stopped || !readAgentToolsEnabledFromDisk()) return false;
+  if (state.stopped || !watchingAllowed()) return false;
   const id = `gh-${createHash("sha256").update(`${sessionId}\0${kind}\0${minute}`).digest("base64url").slice(0, 40)}`;
   const outcome = await state.deps.deliver(sessionId, id, `GitHub update (omp-web): ${text}`);
-  if (state.stopped || !readAgentToolsEnabledFromDisk()) return false;
+  if (state.stopped || !watchingAllowed()) return false;
   if (outcome === "gone") removeSessionWatches(sessionId);
   return outcome !== "retry";
 }
@@ -301,14 +304,14 @@ async function announceResumed(state: WatcherState): Promise<void> {
 const itemsOf = (): string[] => [...new Set(listWatches().map((w) => w.itemKey))];
 
 async function preparePoll(state: WatcherState): Promise<boolean> {
-  if (state.stopped || !readAgentToolsEnabledFromDisk()) return false;
+  if (state.stopped || !watchingAllowed()) return false;
   try {
     await reconcileOutboxReceiptPins();
   } catch (error) {
     warn("outbox receipts could not be reconciled", error);
     return false;
   }
-  return !state.stopped && readAgentToolsEnabledFromDisk();
+  return !state.stopped && watchingAllowed();
 }
 
 /** One pass over every watched item, now. Does nothing while Agent tools is off. */
@@ -327,7 +330,7 @@ function cycle(state: WatcherState): void {
     }, ms);
     state.cancels.add(cancel);
   };
-  const enabled = readAgentToolsEnabledFromDisk();
+  const enabled = watchingAllowed();
   let items: string[] = [];
   if (enabled) {
     try {

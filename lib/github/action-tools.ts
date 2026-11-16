@@ -1,6 +1,6 @@
 import type { HostToolDefinition } from "../pi-types";
 import type { AgentToolContext } from "../agent-tools";
-import { readAgentToolsEnabledFromDisk, readGithubActionsPermissionFromDisk } from "../web-settings";
+import { authorizeToolCapability, isToolCapabilityAllowed } from "../tool-policy-runtime";
 import { checkGh, parseGithubTarget, type GithubTarget } from "./gh";
 import type { GithubToolOps } from "./tools";
 import { listWorkflows, readWorkflow, listRuns, dispatchWorkflow, cancelRun, rerunRun } from "./actions";
@@ -30,12 +30,10 @@ const text = (args: Record<string, unknown>, key: string): string => {
 
 export async function executeActionTool(name: string, args: Record<string, unknown>, ops: GithubToolOps, ctx: AgentToolContext, allowRead: (target: Pick<GithubTarget, "owner" | "repo">) => Promise<void>): Promise<unknown> {
   const operation = name === "github_workflow_dispatch" ? "dispatch" : name === "github_run_cancel" ? "cancel" : name === "github_run_rerun" ? "rerun" : undefined;
-  const ensureEnabled = () => {
-    if (!readAgentToolsEnabledFromDisk()) throw new Error("Agent tools are disabled in Settings (System).");
-    if (operation && readGithubActionsPermissionFromDisk(operation) === "deny") throw new Error(`GitHub Actions ${operation} is blocked by omp-web Settings (System), not by GitHub.`);
+  const ensureNotCancelled = () => {
     if (ctx.signal?.aborted) throw new Error("The tool call was cancelled before the GitHub operation.");
   };
-  ensureEnabled();
+  ensureNotCancelled();
   const runTarget = name === "github_run_cancel" || name === "github_run_rerun" ? parseGithubTarget(text(args, "target")) : undefined;
   if (runTarget && runTarget.kind !== "workflow_run") throw new Error("This operation requires a workflow run URL.");
   const repository = runTarget ? `${runTarget.owner}/${runTarget.repo}` : text(args, "repo");
@@ -48,21 +46,33 @@ export async function executeActionTool(name: string, args: Record<string, unkno
   if (name === "github_run_rerun" && args.mode !== "all" && args.mode !== "failed") throw new Error("mode must be all or failed.");
   if (args.jobId !== undefined && (!Number.isSafeInteger(args.jobId) || Number(args.jobId) < 1)) throw new Error("jobId must be a positive safe integer.");
   if (args.page !== undefined && (!Number.isSafeInteger(args.page) || Number(args.page) < 1)) throw new Error("page must be a positive safe integer.");
+  if (operation && !isToolCapabilityAllowed(`github.actions.${operation}`, ctx.caller)) {
+    throw new Error(`${operation} GitHub Actions is disabled by tool policy.`);
+  }
   await checkGh(ops.run);
   await allowRead({ owner, repo: repoName });
-  ensureEnabled();
+  ensureNotCancelled();
   if (operation) {
-    const details = operation === "dispatch" ? `${repository}, workflow ${selectedWorkflow}, ref ${selectedRef}\nInputs: ${JSON.stringify(inputs)}` : `${args.target}, mode ${args.mode ?? "cancel"}${args.jobId === undefined ? "" : `, job ${args.jobId}`}`;
-    const confirmed = readGithubActionsPermissionFromDisk(operation) !== "allow";
-    if (confirmed && !(await ctx.confirm(`Allow GitHub Actions ${operation} as the server's account?\n${details}`))) throw new Error(`The user declined GitHub Actions ${operation}.`);
-    ensureEnabled();
-    const authorizedRun: GithubToolOps["run"] = (command, input) => {
-      ensureEnabled();
-      if (!confirmed && readGithubActionsPermissionFromDisk(operation) !== "allow") throw new Error(`GitHub Actions ${operation} now requires confirmation in Settings; nothing was sent by this request.`);
+    const capability = `github.actions.${operation}` as const;
+    const details = operation === "dispatch" ? `${repository}, workflow ${selectedWorkflow}, ref ${selectedRef}; inputs ${JSON.stringify(inputs)}` : `${args.target}, mode ${args.mode ?? "cancel"}${args.jobId === undefined ? "" : `, job ${args.jobId}`}`;
+    const authorize = () => authorizeToolCapability({
+      capability,
+      sessionId: ctx.sourceSessionId,
+      resourceType: "github.repository",
+      resourceKey: repository.toLowerCase(),
+      capabilityLabel: `${operation} GitHub Actions (${details})`,
+      confirm: ctx.confirm,
+      caller: ctx.caller,
+      signal: ctx.signal,
+    });
+    await authorize();
+    const authorizedRun: GithubToolOps["run"] = async (command, input) => {
+      await authorize();
+      ensureNotCancelled();
       return ops.run(command, input);
     };
     return withActionReceipt(ctx.sourceSessionId, ctx.sourceRequestId, name, args, async () => {
-      ensureEnabled();
+      await authorize();
       if (operation === "dispatch") return dispatchWorkflow(authorizedRun, repository, selectedWorkflow!, selectedRef!, inputs as Record<string, string | number | boolean>);
       if (operation === "cancel") return cancelRun(authorizedRun, runTarget!);
       return rerunRun(authorizedRun, runTarget!, args.mode as "all" | "failed", args.jobId as number | undefined);

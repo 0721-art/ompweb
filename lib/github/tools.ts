@@ -1,12 +1,12 @@
 import type { HostToolDefinition } from "../pi-types";
 // Types only: agent-tools.ts imports this module for its tool names, so a runtime import back would be a cycle.
 import type { AgentToolContext } from "../agent-tools";
-import { startsUnasked, type AgentToolHost } from "../agent-tool-hosts";
-import { readAgentToolsEnabledFromDisk, readGithubWritesUnaskedFromDisk } from "../web-settings";
+import type { AgentToolHost } from "../agent-tool-hosts";
+import { authorizeToolCapability, isToolCapabilityAllowed } from "../tool-policy-runtime";
 import { baselineCursor, capName } from "./events";
 import { checkGh, defaultGhRunner, formatTarget, parseGithubTarget, type GhRunner, type GithubTarget } from "./gh";
 import { fetchReviewComment, fetchSnapshot, fetchThread, postComment, readItem, resolveThread, type ReadPart } from "./api";
-import { MAX_WATCHES_PER_SESSION, beginWatchIntent, cancelWatchIntent, grantRead, hasReadGrant, itemKeyOf, recordPosted, registerWatchIntent, removeWatch, repoKeyOf, whilePosting } from "./watch-store";
+import { MAX_WATCHES_PER_SESSION, beginWatchIntent, cancelWatchIntent, itemKeyOf, recordPosted, registerWatchIntent, removeWatch, repoKeyOf, whilePosting } from "./watch-store";
 import { ACTION_READ_TOOLS, ACTION_TOOL_DEFINITIONS, executeActionTool, GITHUB_REQUIREMENT as REQUIREMENT } from "./action-tools";
 
 /**
@@ -83,14 +83,11 @@ export const GITHUB_TOOL_DEFINITIONS: HostToolDefinition[] = [
 /** What lib/rpc-manager supplies through `createGithubToolOps`; tests replace `run`. */
 export interface GithubToolOps {
   run: GhRunner;
-  /** Every host; the calling session's own host record decides whether its reads ask (`startsUnasked`). */
   listHosts(): AgentToolHost[];
-  /** The `githubWritesUnasked` setting. */
-  writesUnasked(): boolean;
 }
 
 export function createGithubToolOps(listHosts: () => AgentToolHost[]): GithubToolOps {
-  return { run: defaultGhRunner, listHosts, writesUnasked: readGithubWritesUnaskedFromDisk };
+  return { run: defaultGhRunner, listHosts };
 }
 
 function stringArg(args: Record<string, unknown>, field: string): string {
@@ -115,30 +112,40 @@ function parseIds(value: unknown): string[] | undefined {
   return value;
 }
 
-/** A local session never asks; a remote one asks once per repository unless its host lets agents in. */
-async function allowRead(ops: GithubToolOps, ctx: AgentToolContext, t: Pick<GithubTarget, "owner" | "repo">): Promise<void> {
-  if (ctx.sourceHostId === "local") return;
-  const repoKey = repoKeyOf(t);
-  if (hasReadGrant(ctx.sourceSessionId, repoKey)) return;
-  const host = ops.listHosts().find((h) => h.id === ctx.sourceHostId);
-  if (host && startsUnasked(host, ctx.sourceHostId)) return;
-  if (!(await ctx.confirm(`Let this session on ${host?.label ?? ctx.sourceHostId} read ${t.owner}/${t.repo} through the server's GitHub login?`))) {
-    throw new Error("The user declined GitHub access for this session.");
-  }
-  if (ctx.signal?.aborted) throw new Error("The tool call was cancelled before GitHub access was granted.");
-  grantRead(ctx.sourceSessionId, repoKey);
+async function allowRead(_ops: GithubToolOps, ctx: AgentToolContext, t: Pick<GithubTarget, "owner" | "repo">): Promise<void> {
+  await authorizeToolCapability({
+    capability: "github.read_watch",
+    sessionId: ctx.sourceSessionId,
+    resourceType: "github.repository",
+    resourceKey: repoKeyOf(t),
+    capabilityLabel: "read and watch GitHub",
+    confirm: ctx.confirm,
+    caller: ctx.caller,
+    signal: ctx.signal,
+  });
 }
 
 /** Last step before a write: a cancelled call (host_tool_cancel) must not post after the agent moved on. */
-async function allowWrite(ops: GithubToolOps, ctx: AgentToolContext, title: string): Promise<void> {
-  if (!ops.writesUnasked() && !(await ctx.confirm(title))) throw new Error("The user declined to post on GitHub.");
+async function allowWrite(ctx: AgentToolContext, target: Pick<GithubTarget, "owner" | "repo">, title: string): Promise<void> {
+  await authorizeToolCapability({
+    capability: "github.discussions",
+    sessionId: ctx.sourceSessionId,
+    resourceType: "github.repository",
+    resourceKey: repoKeyOf(target),
+    capabilityLabel: title,
+    confirm: ctx.confirm,
+    caller: ctx.caller,
+    signal: ctx.signal,
+  });
   if (ctx.signal?.aborted) throw new Error("The tool call was cancelled; nothing was posted to GitHub.");
 }
 
 /** validate → gh check → permission → act. */
 export async function executeGithubTool(name: string, args: Record<string, unknown>, ops: GithubToolOps, ctx: AgentToolContext): Promise<unknown> {
-  if (!readAgentToolsEnabledFromDisk()) throw new Error('Agent tools are disabled. Enable "Agent tools" in omp-web Settings (System) first.');
   if (ACTION_TOOL_DEFINITIONS.some(tool => tool.name === name)) return executeActionTool(name, args, ops, ctx, target => allowRead(ops, ctx, target));
+  if ((name === "github_comment" || name === "github_resolve_thread") && !isToolCapabilityAllowed("github.discussions", ctx.caller)) {
+    throw new Error("GitHub discussions is disabled by tool policy.");
+  }
   if (name === "github_resolve_thread") {
     const threadId = stringArg(args, "threadId");
     if (!/^PRRT_[A-Za-z0-9_-]{1,200}$/.test(threadId)) throw new Error('Agent tool argument "threadId" is not a review thread id (PRRT_...).');
@@ -146,7 +153,7 @@ export async function executeGithubTool(name: string, args: Record<string, unkno
     const thread = await fetchThread(ops.run, threadId);
     await allowRead(ops, ctx, thread.target);
     const place = `${formatTarget(thread.target)} ${capName(thread.path)}${thread.line === null ? "" : `:${thread.line}`}`;
-    await allowWrite(ops, ctx, `Resolve review thread ${threadId} on ${place} as the server's GitHub account?`);
+    await allowWrite(ctx, thread.target, `resolve review thread ${threadId} on ${place}`);
     await resolveThread(ops.run, threadId);
     return { resolved: true };
   }
@@ -178,7 +185,7 @@ export async function executeGithubTool(name: string, args: Record<string, unkno
     const preview = body.split("\n", 3).map((line) => line.slice(0, 200)).join("\n");
     const cut = body.length - preview.length;
     const what = replyTo === undefined ? `Post on ${label}` : `Reply in review thread ${replyTo} on ${label}`;
-    await allowWrite(ops, ctx, `${what} as the server's GitHub account?\n${preview}${cut > 0 ? `\n… (+${cut} more characters)` : ""}`);
+    await allowWrite(ctx, t, `${what} as the server's GitHub account\n${preview}${cut > 0 ? `\n… (+${cut} more characters)` : ""}`);
     return whilePosting(item, async () => {
       const posted = await postComment(ops.run, t, body, replyId);
       recordPosted(item, posted.id);

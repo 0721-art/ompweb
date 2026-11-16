@@ -35,7 +35,17 @@ import {
 } from "@/lib/notification-client";
 import { BROWSER_TRANSPORTS, type BrowserTransport } from "@/lib/event-stream-protocol";
 import { setConnectionDiagnosticsEnabled, useConnectionDiagnosticsEnabled } from "@/lib/connection-diagnostics-prefs";
-import type { GithubActionsOperation, GithubActionsPermission, GithubActionsPermissions } from "@/lib/web-settings";
+import type { OperationPolicy, ToolPolicies } from "@/lib/tool-access-policy";
+type GithubActionsOperation = "dispatch" | "cancel" | "rerun";
+type GithubActionsPermission = "deny" | "ask" | "allow";
+type GithubActionsPermissions = Record<GithubActionsOperation, GithubActionsPermission>;
+
+const globalToolPolicy = (data: unknown, capability: keyof ToolPolicies["global"]): OperationPolicy | null => {
+  if (!isRecord(data) || !isRecord(data.toolPolicies) || !isRecord(data.toolPolicies.global)) return null;
+  const policy = data.toolPolicies.global[capability];
+  if (!isRecord(policy) || typeof policy.enabled !== "boolean" || (policy.confirmation !== "ask" && policy.confirmation !== "allow")) return null;
+  return { enabled: policy.enabled, confirmation: policy.confirmation };
+};
 const SettingsTabLoading = () => {
   const { t } = useI18n();
   return <div role="status" style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: "var(--text-sm)" }}>{t("settingsConfig.loadingSettings")}</div>;
@@ -319,7 +329,7 @@ function AgentToolsSetting() {
     let alive = true;
     fetch("/api/web-settings")
       .then((res) => (res.ok ? res.json() : null))
-      .then((data: { agentToolsEnabled?: boolean } | null) => { if (alive) setEnabled(data?.agentToolsEnabled === true); })
+      .then((data: unknown) => { if (alive) setEnabled(globalToolPolicy(data, "ompweb.agent_tools")?.enabled ?? false); })
       .catch(() => { if (alive) setEnabled(false); });
     return () => { alive = false; };
   }, []);
@@ -330,7 +340,7 @@ function AgentToolsSetting() {
       const res = await fetch("/api/web-settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ agentToolsEnabled: next }),
+        body: JSON.stringify({ toolPolicies: { global: { "ompweb.agent_tools": { enabled: next, confirmation: next ? "allow" : "ask" } } } }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
     } catch (error) {
@@ -355,8 +365,8 @@ function GithubWritesSetting() {
     try {
       const res = await fetch("/api/web-settings");
       if (!res.ok) return null;
-      const data: { githubWritesUnasked?: boolean } = await res.json();
-      return typeof data.githubWritesUnasked === "boolean" ? data.githubWritesUnasked : null;
+      const policy = globalToolPolicy(await res.json(), "github.discussions");
+      return policy ? policy.enabled && policy.confirmation === "allow" : null;
     } catch {
       return null;
     }
@@ -373,7 +383,7 @@ function GithubWritesSetting() {
       const res = await fetch("/api/web-settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ githubWritesUnasked: next }),
+        body: JSON.stringify({ toolPolicies: { global: { "github.discussions": { enabled: true, confirmation: next ? "allow" : "ask" } } } }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
     } catch (error) {
@@ -401,15 +411,13 @@ function GithubActionsPermissionsSetting() {
     try {
       const res = response ?? await fetch("/api/web-settings");
       if (!res.ok) return null;
-      const data: { githubActionsPermissions?: unknown } = await res.json();
-      if (!isRecord(data.githubActionsPermissions)) return null;
-      const values = data.githubActionsPermissions;
-      if (!GITHUB_ACTIONS_OPERATIONS.every((operation) => values[operation] === "deny" || values[operation] === "ask" || values[operation] === "allow")) return null;
-      return {
-        dispatch: values.dispatch as GithubActionsPermission,
-        cancel: values.cancel as GithubActionsPermission,
-        rerun: values.rerun as GithubActionsPermission,
-      };
+      const data: unknown = await res.json();
+      const policies = GITHUB_ACTIONS_OPERATIONS.map((operation) => [operation, globalToolPolicy(data, `github.actions.${operation}`)] as const);
+      if (policies.some(([, policy]) => !policy)) return null;
+      return Object.fromEntries(policies.map(([operation, policy]) => [
+        operation,
+        !policy!.enabled ? "deny" : policy!.confirmation,
+      ])) as GithubActionsPermissions;
     } catch {
       return null;
     }
@@ -427,7 +435,9 @@ function GithubActionsPermissionsSetting() {
       const res = await fetch("/api/web-settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ githubActionsPermissions: { [operation]: next } }),
+        body: JSON.stringify({ toolPolicies: { global: {
+          [`github.actions.${operation}`]: { enabled: next !== "deny", confirmation: next === "allow" ? "allow" : "ask" },
+        } } }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const saved = await load(res);

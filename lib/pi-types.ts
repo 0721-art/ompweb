@@ -268,6 +268,10 @@ export interface HostToolCallFrame {
   toolCallId: string;
   toolName: string;
   arguments: Record<string, unknown>;
+  caller?: {
+    agentId?: string;
+    modelRole?: string;
+  };
 }
 
 export interface HostToolCancelFrame {

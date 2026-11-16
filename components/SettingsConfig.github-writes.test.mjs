@@ -23,6 +23,10 @@ const settingsProps = {
   onRequestAppUpdate: noop, onSelectTab: noop, onClose: noop,
 };
 
+const policies = (allow) => ({ toolPolicies: { global: {
+  "github.discussions": { enabled: true, confirmation: allow ? "allow" : "ask" },
+} } });
+
 /** `get` answers the settings load; each PUT waits until the test releases it. */
 function fakeSettings(t, get) {
   const puts = [];
@@ -55,7 +59,7 @@ test("a lost GitHub writes save reloads the persisted permission before re-enabl
   let loads = 0;
   const puts = fakeSettings(t, () => {
     loads++;
-    return Response.json({ githubWritesUnasked: persisted });
+    return Response.json(policies(persisted));
   });
   const { container } = render(createElement(SettingsConfig, settingsProps));
   await settle();
@@ -63,7 +67,7 @@ test("a lost GitHub writes save reloads the persisted permission before re-enabl
 
   fireEvent.click(toggle);
   await settle();
-  assert.deepEqual(puts.map((put) => put.body), ['{"githubWritesUnasked":true}']);
+  assert.deepEqual(puts.map((put) => put.body), ['{"toolPolicies":{"global":{"github.discussions":{"enabled":true,"confirmation":"allow"}}}}']);
   const previousLoads = loads;
   persisted = true;
   puts[0].fail();
@@ -78,7 +82,7 @@ test("a failed GitHub writes reconciliation GET leaves the permission unknown an
   let loads = 0;
   const puts = fakeSettings(t, () => {
     loads++;
-    return failReload ? Response.json({}, { status: 500 }) : Response.json({ githubWritesUnasked: false });
+    return failReload ? Response.json({}, { status: 500 }) : Response.json(policies(false));
   });
   const { container } = render(createElement(SettingsConfig, settingsProps));
   await settle();
@@ -96,7 +100,7 @@ test("a failed GitHub writes reconciliation GET leaves the permission unknown an
 
 
 test("the GitHub writes switch takes no second change until its save lands", async (t) => {
-  const puts = fakeSettings(t, () => Response.json({ githubWritesUnasked: false }));
+  const puts = fakeSettings(t, () => Response.json(policies(false)));
   const { container } = render(createElement(SettingsConfig, settingsProps));
   await settle();
   const toggle = within(container).getByRole("switch", { name: LABEL });
@@ -104,7 +108,7 @@ test("the GitHub writes switch takes no second change until its save lands", asy
 
   fireEvent.click(toggle);
   await settle();
-  assert.deepEqual(puts.map((p) => p.body), ['{"githubWritesUnasked":true}']);
+  assert.deepEqual(puts.map((p) => p.body), ['{"toolPolicies":{"global":{"github.discussions":{"enabled":true,"confirmation":"allow"}}}}']);
   assert.equal(toggle.disabled, true, "an off click now could reach the server before the on");
   fireEvent.click(toggle);
   await settle();

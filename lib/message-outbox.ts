@@ -21,7 +21,7 @@ import type { OutboxEntry, OutboxMode } from "./types";
 import { MAX_UPLOADS_PER_MESSAGE, UPLOAD_ID_RE } from "./upload-limits";
 import { snapshotOutboxUploads, UploadError, type OutboxUploadReceipt } from "./uploads";
 import { resolveWebAuthSecret } from "./web-auth-secret";
-import { readAgentToolsEnabledFromDisk } from "./web-settings";
+import { isToolCapabilityAllowed } from "./tool-policy-runtime";
 
 /** Delivered (and removed) ids answer a repeated `outbox_add` this long (spec O2: idempotent by id); the browser gives
  * up resending after 7 days, so a resend always finds its id. */
@@ -545,7 +545,7 @@ export async function runOutboxCommand(sessionId: string, command: Record<string
         return { kind: "existing", entry: concurrent, ...(confirmsReplacement ? { replaces: confirmsReplacement } : {}) };
       }
       // Host discovery may have awaited while another server disabled the watcher.
-      if (owner === GITHUB_WATCH_OUTBOX_OWNER && !readAgentToolsEnabledFromDisk()) return { kind: "paused" };
+      if (owner === GITHUB_WATCH_OUTBOX_OWNER && (!isToolCapabilityAllowed("ompweb.agent_tools") || !isToolCapabilityAllowed("github.read_watch"))) return { kind: "paused" };
       const original = typeof replaces === "string" ? row(replaces) : null;
       const originalMatchesSession = original !== null && entryBelongsToSession(original, sessionId);
       if (original && originalMatchesSession && original.replacement_id) {

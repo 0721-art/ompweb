@@ -3,7 +3,7 @@
 import { useEffect, useId, useState, type FormEvent } from "react";
 import { Copy, Pencil, Plus, Trash2 } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui/field";
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/primitives";
+import { Dialog, DialogContent, DialogTitle, ThemedSelect } from "@/components/ui/primitives";
 import { ToggleSwitch } from "@/components/ui/ToggleSwitch";
 import { toast } from "@/components/ui/toast";
 import { copyText } from "@/lib/clipboard";
@@ -190,7 +190,7 @@ const joinBlock = (row: HostRow) => clusterJoinBlock({ status: row.status, ompVe
 function HostCard({ host, cluster, onRename, onRevoke, onShare, onJoin, onLeave }: { host: HostRow; cluster: ClusterState; onRename: () => void; onRevoke: () => void; onShare: () => void; onJoin: () => void; onLeave: () => void }) {
   const { t } = useI18n();
   const name = hostName(t, host);
-  const linked = "allowAgentStart" in host ? host : null;
+  const linked = "agentStartPolicy" in host ? host : null;
   const member = isClusterMember(cluster.pools, host.id);
   // Unknown membership (pools not loaded) disables every switch and every share toggle; the reason is only shown once the load failed.
   // Otherwise only a non-member needs a ready host, and this machine too while it is not a member: leaving always works.
@@ -260,10 +260,18 @@ function HostCard({ host, cluster, onRename, onRevoke, onShare, onJoin, onLeave 
         {linked && (
           <div style={{ display: "flex", alignItems: "center", gap: 6, maxWidth: "100%" }}>
             <span style={{ fontSize: 11, color: "var(--text-muted)", maxWidth: 200 }}>{t("hostsConfig.allowAgentStart")}</span>
-            <ToggleSwitch
-              checked={linked.allowAgentStart}
+            <ThemedSelect
+              value={!linked.agentStartPolicy.enabled ? "deny" : linked.agentStartPolicy.confirmation}
               aria-label={t("hostsConfig.allowAgentStartAria", { name })}
-              onChange={(allowAgentStart) => void call("PATCH", "/api/hosts", { id: host.id, allowAgentStart }).catch(failure)}
+              options={[
+                { value: "deny", label: t("settingsConfig.githubActionsPermissionDeny") },
+                { value: "ask", label: t("settingsConfig.githubActionsPermissionAsk") },
+                { value: "allow", label: t("settingsConfig.githubActionsPermissionAllow") },
+              ]}
+              onChange={(value) => void call("PATCH", "/api/hosts", {
+                id: host.id,
+                agentStartPolicy: { enabled: value !== "deny", confirmation: value === "allow" ? "allow" : "ask" },
+              }).catch(failure)}
             />
           </div>
         )}

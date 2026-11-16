@@ -21,6 +21,7 @@ import {
   type AgentToolSessionOps,
 } from "./agent-tools";
 import type { AgentToolHost } from "./agent-tool-hosts";
+import { validateToolCaller } from "./tool-policy-runtime";
 import { createGithubToolOps, GITHUB_REPLAY_SAFE_TOOLS, GITHUB_TOOL_NAMES } from "./github/tools";
 import { markShuttingDown, recordRunningSessions, resumeOnHostLink, takeInterruptedSessions, type InterruptibleSession } from "./session-resume";
 import { RESUME_PROMPT } from "./hosts/host-resume";
@@ -94,6 +95,12 @@ const IDLE_DESTROY_MS = 10 * 60 * 1000;
  * the idle backstop. Set `OMP_WEB_DISCONNECT_DESTROY_MS=0` to disable reaping
  * and fall back to IDLE_DESTROY_MS alone.
  */
+function agentToolsAvailable(): boolean {
+  const policies = loadWebServerSettings().toolPolicies;
+  if (policies.global["ompweb.agent_tools"]?.enabled) return true;
+  return [...Object.values(policies.agents), ...Object.values(policies.modelRoles)]
+    .some((scope) => scope["ompweb.agent_tools"]?.enabled);
+}
 const DISCONNECT_DESTROY_MS = process.env.OMP_WEB_DISCONNECT_DESTROY_MS !== undefined
   ? Math.max(0, Number(process.env.OMP_WEB_DISCONNECT_DESTROY_MS) || 0)
   : 120_000;
@@ -977,7 +984,7 @@ export class AgentSessionWrapper {
       // Frames omp sent during the handshake are live: its agent tool calls there run normally.
       this.proc.release();
       this.adoptionReplay = undefined;
-      if (this.hostOwnedLifecycle && loadWebServerSettings().agentToolsEnabled) {
+      if (this.hostOwnedLifecycle && agentToolsAvailable()) {
         await this.dispatchCommand({ type: "set_host_tools", tools: this.registeredHostTools ?? [] });
       }
     } finally {
@@ -1357,28 +1364,15 @@ export class AgentSessionWrapper {
         // is an explicit error, not a silent hang and not a browser call.
         if (id && toolName && AGENT_TOOL_NAMES.has(toolName)) {
           // Independent pooled creations have durable native-request identity; other mutations stay unknown.
-          if (this.replaying && toolName !== "list_sessions" && !GITHUB_REPLAY_SAFE_TOOLS.has(toolName) && (toolName !== "new_session" || !loadWebServerSettings().agentToolsEnabled)) {
+          if (this.replaying && toolName !== "list_sessions" && !GITHUB_REPLAY_SAFE_TOOLS.has(toolName) && toolName !== "new_session") {
             this.proc.sendFrame({
               type: "host_tool_result",
               id,
               isError: true,
               result: { content: [{ type: "text", text: unknownOutcome(toolName) }] },
             });
-          } else if (loadWebServerSettings().agentToolsEnabled) {
-            void this.answerServerAgentTool(event, sourceProc);
           } else {
-            this.proc.sendFrame({
-              type: "host_tool_result",
-              id,
-              isError: true,
-              result: {
-                content: [{
-                  type: "text",
-                  text: "Agent tools are disabled. Enable \"Agent tools\" in omp-web Settings (System) first.",
-                }],
-              },
-            });
-            this.emit({ type: "notice", level: "warning", message: `Rejected disabled agent tool: ${toolName}` });
+            void this.answerServerAgentTool(event, sourceProc);
           }
           return;
         }
@@ -1399,7 +1393,16 @@ export class AgentSessionWrapper {
           if (otherTabs.size > 0) {
             this.pendingHostTools.set(id, { event, crossSessionId: this.sessionId });
             const args = event.arguments && typeof event.arguments === "object" ? event.arguments as Record<string, unknown> : {};
-            const call: CrossSessionHostToolCall = { sessionId: this.sessionId, hostId: this.host.id, cwd: this.cwd, id, toolName, arguments: args };
+            const caller = validateToolCaller(event.caller);
+            const call: CrossSessionHostToolCall = {
+              sessionId: this.sessionId,
+              hostId: this.host.id,
+              cwd: this.cwd,
+              id,
+              toolName,
+              arguments: args,
+              ...(caller ? { caller } : {}),
+            };
             for (const listener of otherTabs) {
               try { listener(call); } catch { /* ignore listener errors */ }
             }
@@ -1995,7 +1998,7 @@ export class AgentSessionWrapper {
         sourceRequestId: id,
         sourceCwd: this.cwd,
         sourceHostId: this.host.id,
-        enabled: loadWebServerSettings().agentToolsEnabled,
+        caller: validateToolCaller(event.caller),
         guard: getAgentToolGuard(),
         confirm: (title) => this.confirmFromServer(title, cancel.signal),
         signal: cancel.signal,
@@ -2437,7 +2440,7 @@ export class AgentSessionWrapper {
         if (this.hostOwnedLifecycle) {
           if (this.registeredHostTools !== null) {
             await this.dispatchCommand({ type: "set_host_tools", tools: this.registeredHostTools });
-          } else if (loadWebServerSettings().agentToolsEnabled) {
+          } else if (agentToolsAvailable()) {
             // Like initial startup, a runtime that never accepted host tools may reject this optional registration.
             await this.dispatchCommand({ type: "set_host_tools", tools: [] }).catch(() => {});
           }
@@ -2930,7 +2933,7 @@ export class AgentSessionWrapper {
         // a no-tab session keeps them after its startup registration.
         // With the gate off the registration is exactly what the caller
         // asked for, so existing behavior and tests are unchanged.
-        const merged = loadWebServerSettings().agentToolsEnabled
+        const merged = agentToolsAvailable()
           ? [...valid, ...AGENT_TOOL_DEFINITIONS.filter((t) => !valid.some((v) => v.name === t.name))]
           : valid;
         if (this.hostOwnedLifecycle) {
@@ -2973,7 +2976,7 @@ export class AgentSessionWrapper {
           this.hostUriSchemes = new Map(schemes.filter((entry) => typeof entry.scheme === "string" && entry.scheme).map((entry) => [entry.scheme as string, { writable: entry.writable === true }]));
           try {
             const tools = this.registeredHostTools ?? [];
-            const merged = loadWebServerSettings().agentToolsEnabled
+            const merged = agentToolsAvailable()
               ? [...tools, ...AGENT_TOOL_DEFINITIONS.filter((tool) => !tools.some((entry) => entry.name === tool.name))]
               : tools;
             await this.proc.transport.setHostTools!(merged, [...this.hostUriSchemes].map(([scheme, { writable }]) => ({ scheme, writable: writable === true })));
@@ -3411,8 +3414,8 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
   const hosts = (): AgentToolHost[] => {
     const local = getHost(LOCAL_HOST_ID);
     return [
-      { id: local.id, label: local.label, online: isLinkUp(local.status()), allowAgentStart: true },
-      ...listHosts().map((h) => ({ id: h.id, label: h.label, online: isLinkUp(h.status), allowAgentStart: h.allowAgentStart })),
+      { id: local.id, label: local.label, online: isLinkUp(local.status()), agentStartPolicy: { enabled: true, confirmation: "allow" } },
+      ...listHosts().map((h) => ({ id: h.id, label: h.label, online: isLinkUp(h.status), agentStartPolicy: h.agentStartPolicy })),
     ];
   };
   return {
@@ -3723,7 +3726,7 @@ export async function startRpcSession(
       // later UI registration, so this never drops the UI tools. Older omp
       // builds without host tools simply reject the registration; ignore
       // that the way the UI registration does.
-      if (!created.hostOwnedLifecycle && loadWebServerSettings().agentToolsEnabled) {
+      if (!created.hostOwnedLifecycle && agentToolsAvailable()) {
         await created.send({ type: "set_host_tools", tools: AGENT_TOOL_DEFINITIONS }).catch(() => {});
       }
     } catch (error) {

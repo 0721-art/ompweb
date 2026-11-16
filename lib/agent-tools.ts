@@ -1,6 +1,7 @@
 import type { HostToolDefinition } from "./pi-types";
 import { isRecord } from "./type-guards";
-import { startsUnasked, type AgentToolHost } from "./agent-tool-hosts";
+import { hostStartsUnasked, type AgentToolHost } from "./agent-tool-hosts";
+import { authorizeToolCapability, type ToolCaller } from "./tool-policy-runtime";
 import { GITHUB_TOOL_DEFINITIONS, GITHUB_TOOL_NAMES, executeGithubTool, type GithubToolOps } from "./github/tools";
 
 /**
@@ -151,8 +152,7 @@ export interface AgentToolContext {
   sourceCwd: string;
   /** The host the calling session runs on; "local" is this machine. */
   sourceHostId: string;
-  /** The off-by-default Settings gate (lib/web-settings agentToolsEnabled). */
-  enabled: boolean;
+  caller?: ToolCaller;
   guard: AgentToolGuard;
   /** Ask the calling session's user; resolves false when declined or the dialog is dropped. */
   confirm(title: string): Promise<boolean>;
@@ -327,10 +327,15 @@ export async function executeAgentTool(
   ops: AgentToolSessionOps,
   ctx: AgentToolContext,
 ): Promise<unknown> {
-  if (!ctx.enabled) {
-    throw new Error("Agent tools are disabled. Enable \"Agent tools\" in omp-web Settings (System) first.");
-  }
   if (!AGENT_TOOL_NAMES.has(toolName)) throw new Error(`Unknown agent tool: ${toolName}.`);
+  await authorizeToolCapability({
+    capability: "ompweb.agent_tools",
+    sessionId: ctx.sourceSessionId,
+    capabilityLabel: "use omp-web agent tools",
+    confirm: ctx.confirm,
+    caller: ctx.caller,
+    signal: ctx.signal,
+  });
   const record = asRecord(args);
 
   if (GITHUB_TOOL_NAMES.has(toolName)) {
@@ -374,7 +379,23 @@ export async function executeAgentTool(
       provider,
       modelId,
       name,
-    }, async (target) => startsUnasked(target, ctx.sourceHostId) || ctx.confirm(`Start a session on ${target.label} in ${cwd}?`));
+    }, async (target) => {
+      const targetPolicy = target.id === "local" && ctx.sourceHostId !== "local"
+        ? { enabled: true, confirmation: "ask" as const }
+        : target.agentStartPolicy;
+      await authorizeToolCapability({
+        capability: "ompweb.session_start",
+        sessionId: ctx.sourceSessionId,
+        resourceType: "host",
+        resourceKey: target.id,
+        capabilityLabel: `start a session on ${target.label}`,
+        confirm: ctx.confirm,
+        caller: ctx.caller,
+        target: targetPolicy,
+        signal: ctx.signal,
+      });
+      return true;
+    });
     ctx.guard.setDepth(created.sessionId, depth);
     return { sessionId: created.sessionId };
   }
@@ -396,7 +417,7 @@ export async function executeAgentTool(
     if (!targetHostId) throw new Error(`Session not found: ${sessionId}`);
     const hosts = ops.listHosts();
     const target = hosts.find((h) => h.id === targetHostId);
-    if (targetHostId !== ctx.sourceHostId && !(target && startsUnasked(target, ctx.sourceHostId))) {
+    if (targetHostId !== ctx.sourceHostId && !(target && hostStartsUnasked(target) && target.id !== "local")) {
       const sourceLabel = hosts.find((h) => h.id === ctx.sourceHostId)?.label ?? ctx.sourceHostId;
       if (!(await ctx.confirm(`Send a message from a session on ${sourceLabel} to session ${sessionId} on ${target?.label ?? targetHostId}?`))) {
         throw new Error(`The user declined to send a message to session ${sessionId}.`);

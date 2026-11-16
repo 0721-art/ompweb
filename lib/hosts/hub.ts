@@ -1670,7 +1670,7 @@ export interface LinkedHostRow {
   apiVersion?: number;
   platform: string | null;
   lastSeenAt: string | null;
-  allowAgentStart: boolean;
+  agentStartPolicy: HostRecord["agentStartPolicy"];
   shareCredentials: boolean;
   /** Link protocol version the daemon last presented; null before it ever dialed. */
   hostVersion: number | null;
@@ -1703,7 +1703,7 @@ export function listHosts(): LinkedHostRow[] {
       ompwebVersion: maintenance?.ompwebVersion ?? link?.ompwebVersion ?? null,
       platform: maintenance?.platform ?? link?.platform ?? null,
       lastSeenAt: link?.lastSeenAt ?? record.lastSeenAt,
-      allowAgentStart: record.allowAgentStart,
+      agentStartPolicy: record.agentStartPolicy,
       shareCredentials: record.shareCredentials,
       hostVersion: link?.hostVersion ?? maintenance?.protocolVersion ?? null,
       serverVersion: LINK_PROTOCOL_VERSION,

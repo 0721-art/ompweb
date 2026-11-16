@@ -39,7 +39,7 @@ const DEFAULT_TOOL_POLICIES: ToolPolicies = {
   version: 1,
   global: {
     "ompweb.agent_tools": DENY,
-    "ompweb.session_start": ASK,
+    "ompweb.session_start": ALLOW,
     "browser.open_url": ALLOW,
     "github.read_watch": ASK,
     "github.discussions": ASK,
@@ -221,41 +221,6 @@ export function loadWebServerSettings(): WebServerSettings {
   return settings;
 }
 
-function freshToolPolicies(): ToolPolicies | null {
-  const raw = freshSettingsRecord();
-  return raw ? migrateToolPolicies(raw) : null;
-}
-
-/** Fresh compatibility readers used until enforcement adapters consume the shared resolver. */
-export function readAgentToolsEnabledFromDisk(): boolean {
-  try {
-    return freshToolPolicies()?.global["ompweb.agent_tools"]?.enabled === true;
-  } catch {
-    return false;
-  }
-}
-
-export function readGithubWritesUnaskedFromDisk(): boolean {
-  try {
-    const policy = freshToolPolicies()?.global["github.discussions"];
-    return policy?.enabled === true && policy.confirmation === "allow";
-  } catch {
-    return false;
-  }
-}
-
-export type GithubActionsOperation = "dispatch" | "cancel" | "rerun";
-export type GithubActionsPermission = "deny" | "ask" | "allow";
-export type GithubActionsPermissions = Record<GithubActionsOperation, GithubActionsPermission>;
-
-export function readGithubActionsPermissionFromDisk(operation: GithubActionsOperation): GithubActionsPermission {
-  try {
-    const policy = freshToolPolicies()?.global[`github.actions.${operation}`];
-    return !policy?.enabled ? "deny" : policy.confirmation;
-  } catch {
-    return "deny";
-  }
-}
 
 export function parseToolPoliciesPatch(value: unknown): ToolPoliciesPatch {
   if (!isRecord(value) || Object.keys(value).some((key) => !["version", "global", "modelRoles", "agents"].includes(key)) || (value.version !== undefined && value.version !== 1)) {

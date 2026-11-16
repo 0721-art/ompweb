@@ -528,6 +528,10 @@ export interface CrossSessionHostToolCall {
   id: string;
   toolName: string;
   arguments: Record<string, unknown>;
+  caller?: {
+    agentId?: string;
+    modelRole?: string;
+  };
 }
 
 export type CrossSessionHostToolEvent = (CrossSessionHostToolCall & { type?: "host_tool_call" }) | {

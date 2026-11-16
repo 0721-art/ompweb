@@ -3,6 +3,7 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "../omp/paths";
+import type { OperationPolicy } from "../tool-access-policy";
 
 export interface HostRecord {
   id: string;
@@ -10,7 +11,7 @@ export interface HostRecord {
   tokenHash: string;
   createdAt: string;
   lastSeenAt: string | null;
-  allowAgentStart: boolean;
+  agentStartPolicy: OperationPolicy;
   shareCredentials: boolean;
 }
 
@@ -36,6 +37,15 @@ function normalizeLabel(label: string): string {
 }
 
 const sha256Hex = (token: string): string => createHash("sha256").update(token).digest("hex");
+const ASK: OperationPolicy = { enabled: true, confirmation: "ask" };
+const ALLOW: OperationPolicy = { enabled: true, confirmation: "allow" };
+
+function operationPolicy(value: unknown): OperationPolicy | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const policy = value as Record<string, unknown>;
+  if (typeof policy.enabled !== "boolean" || (policy.confirmation !== "ask" && policy.confirmation !== "allow")) return undefined;
+  return { enabled: policy.enabled, confirmation: policy.confirmation };
+}
 
 // Keep only usable records so one bad entry cannot break token lookup for the rest.
 function parseHostRecord(raw: unknown): HostRecord | null {
@@ -48,7 +58,7 @@ function parseHostRecord(raw: unknown): HostRecord | null {
     tokenHash: r.tokenHash,
     createdAt: typeof r.createdAt === "string" ? r.createdAt : "",
     lastSeenAt: typeof r.lastSeenAt === "string" ? r.lastSeenAt : null,
-    allowAgentStart: r.allowAgentStart === true,
+    agentStartPolicy: operationPolicy(r.agentStartPolicy) ?? (r.allowAgentStart === true ? ALLOW : ASK),
     shareCredentials: r.shareCredentials === true,
   };
 }
@@ -110,7 +120,7 @@ export function createHost(label: string): { host: HostRecord; token: string } {
     tokenHash: sha256Hex(token),
     createdAt: new Date().toISOString(),
     lastSeenAt: null,
-    allowAgentStart: false,
+    agentStartPolicy: ASK,
     shareCredentials: false,
   };
   saveHosts([...readHosts(), host]);
@@ -132,14 +142,18 @@ export class ReservedHostError extends Error {
   }
 }
 
-export function updateHost(id: string, updates: { label?: string; allowAgentStart?: boolean; shareCredentials?: boolean }): HostRecord {
-  if (id === LOCAL_HOST_ID && (updates.allowAgentStart !== undefined || updates.shareCredentials !== undefined)) throw new ReservedHostError();
+export function updateHost(id: string, updates: { label?: string; agentStartPolicy?: OperationPolicy; shareCredentials?: boolean }): HostRecord {
+  if (id === LOCAL_HOST_ID && (updates.agentStartPolicy !== undefined || updates.shareCredentials !== undefined)) throw new ReservedHostError();
   const hosts = readHosts();
   const host = hosts.find((h) => h.id === id);
   if (!host) throw new UnknownHostError();
   // An empty name resets this machine to the default.
   if (updates.label !== undefined) host.label = id === LOCAL_HOST_ID && !updates.label.trim() ? "" : normalizeLabel(updates.label);
-  if (updates.allowAgentStart !== undefined) host.allowAgentStart = updates.allowAgentStart;
+  if (updates.agentStartPolicy !== undefined) {
+    const policy = operationPolicy(updates.agentStartPolicy);
+    if (!policy) throw new Error("Invalid agent-start policy");
+    host.agentStartPolicy = policy;
+  }
   if (updates.shareCredentials !== undefined) host.shareCredentials = updates.shareCredentials;
   saveHosts(hosts);
   return host;
@@ -156,7 +170,7 @@ export function rotateLocalHostToken(): string {
     tokenHash: sha256Hex(token),
     createdAt: existing?.createdAt || new Date().toISOString(),
     lastSeenAt: existing?.lastSeenAt ?? null,
-    allowAgentStart: true,
+    agentStartPolicy: ALLOW,
     shareCredentials: false,
   };
   saveHosts([...hosts.filter((h) => h.id !== LOCAL_HOST_ID), record]);

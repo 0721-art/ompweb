@@ -30,6 +30,12 @@ async function choose(select, name) {
   await settle();
 }
 
+const policies = (dispatch, cancel, rerun) => ({ toolPolicies: { global: {
+  "github.actions.dispatch": { enabled: dispatch !== "deny", confirmation: dispatch === "allow" ? "allow" : "ask" },
+  "github.actions.cancel": { enabled: cancel !== "deny", confirmation: cancel === "allow" ? "allow" : "ask" },
+  "github.actions.rerun": { enabled: rerun !== "deny", confirmation: rerun === "allow" ? "allow" : "ask" },
+} } });
+
 function installFetch(t, get) {
   const puts = [];
   const originalFetch = globalThis.fetch;
@@ -51,7 +57,7 @@ function installFetch(t, get) {
 
 test("GitHub Actions permission controls stay disabled until their settings load", async (t) => {
   const pending = Promise.withResolvers();
-  installFetch(t, () => pending.promise.then(() => Response.json({ githubActionsPermissions: { dispatch: "ask", cancel: "ask", rerun: "ask" } })));
+  installFetch(t, () => pending.promise.then(() => Response.json(policies("ask", "ask", "ask"))));
   const { container } = render(createElement(SettingsConfig, settingsProps));
   const page = within(container);
   const selects = [
@@ -66,9 +72,7 @@ test("GitHub Actions permission controls stay disabled until their settings load
 });
 
 test("GitHub Actions permissions load as three selects and save only the changed operation", async (t) => {
-  const puts = installFetch(t, () => Response.json({
-    githubActionsPermissions: { dispatch: "ask", cancel: "deny", rerun: "allow" },
-  }));
+  const puts = installFetch(t, () => Response.json(policies("ask", "deny", "allow")));
   const { container } = render(createElement(SettingsConfig, settingsProps));
   await settle();
   const page = within(container);
@@ -78,9 +82,9 @@ test("GitHub Actions permissions load as three selects and save only the changed
   assert.equal(page.getByRole("combobox", { name: "Rerun workflow runs" }).textContent, "Allow without asking");
 
   await choose(dispatch, "Allow without asking");
-  assert.deepEqual(puts.map(({ body }) => body), ['{"githubActionsPermissions":{"dispatch":"allow"}}']);
+  assert.deepEqual(puts.map(({ body }) => body), ['{"toolPolicies":{"global":{"github.actions.dispatch":{"enabled":true,"confirmation":"allow"}}}}']);
   assert.equal(dispatch.disabled, true, "the control stays disabled while its save is in flight");
-  puts[0].resolve(Response.json({ githubActionsPermissions: { dispatch: "allow", cancel: "allow", rerun: "deny" } }));
+  puts[0].resolve(Response.json(policies("allow", "allow", "deny")));
   await settle();
   assert.equal(dispatch.disabled, false);
   assert.equal(dispatch.textContent, "Allow without asking");
@@ -89,11 +93,11 @@ test("GitHub Actions permissions load as three selects and save only the changed
 });
 
 test("an uncertain GitHub Actions save re-fetches disk state and never presents the unsaved choice as successful", async (t) => {
-  let persisted = { dispatch: "ask", cancel: "ask", rerun: "ask" };
+  let persisted = policies("ask", "ask", "ask");
   let loads = 0;
   const puts = installFetch(t, () => {
     loads++;
-    return Response.json({ githubActionsPermissions: persisted });
+    return Response.json(persisted);
   });
   const { container } = render(createElement(SettingsConfig, settingsProps));
   await settle();
