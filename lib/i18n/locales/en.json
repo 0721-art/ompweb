@@ -1513,6 +1513,7 @@
   "settingsConfig.autoSaved": "Auto-saved",
   "settingsConfig.searchPlaceholder": "Search settings...",
   "settingsConfig.closeSettings": "Close settings",
+  "settingsConfig.moreInformationAbout": "More information about {label}",
   "settingsConfig.noSettingsMatch": "No settings match “{query}”.",
   "settingsConfig.searchResults.one": "{count} result for “{query}”.",
   "settingsConfig.searchResults.other": "{count} results for “{query}”.",

@@ -1,6 +1,7 @@
 "use client";
 
 import { ToggleSwitch } from "@/components/ui/ToggleSwitch";
+import { SettingInfo } from "@/components/ui/SettingInfo";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useTransition, cloneElement, isValidElement, type ReactElement, type ReactNode } from "react";
 import { getSubmitDuringRunBehavior, getWordCompletionMode, setSubmitDuringRunBehavior, setWordCompletionMode, type SubmitDuringRunBehavior, type WordCompletionMode } from "@/lib/composer-prefs";
@@ -157,8 +158,31 @@ type SettingIndexEntry = {
   fallbackSection: string;
   fallbackLabel: string;
   fallbackDesc: string;
+  infoKey?: string;
+  fallbackInfo?: string;
   scope?: "UI" | "Native OMP" | "Workspace";
 };
+
+type LocalizedSettingSearch = {
+  label: string;
+  description: string;
+  section: string;
+  info?: string;
+};
+
+export function matchSettingSearch(setting: SettingIndexEntry, localized: LocalizedSettingSearch, query: string): SearchResult | null {
+  const haystack = `${localized.label} ${localized.description} ${localized.section} ${localized.info ?? ""} ${setting.fallbackLabel} ${setting.fallbackDesc} ${setting.fallbackSection} ${setting.fallbackInfo ?? ""}`.toLowerCase();
+  if (!haystack.includes(query.toLowerCase())) return null;
+  return {
+    id: setting.id,
+    kind: "setting",
+    tab: setting.tab,
+    label: localized.label,
+    description: localized.description,
+    scope: setting.scope,
+    section: localized.section,
+  };
+}
 
 const SETTING_INDEX: SettingIndexEntry[] = [
   // Interface & Behavior
@@ -887,7 +911,7 @@ function NotificationSettingsPanel() {
 }
 
 /** `disabled` only dims the row; the child control must be disabled itself. */
-function NativeSetting({ label, description, scope, searchId, disabled, children }: { label: string; description: string; scope?: "UI" | "Native OMP" | "Workspace"; searchId?: string; disabled?: boolean; children: ReactNode }) {
+export function NativeSetting({ label, description, info, scope, searchId, disabled, children }: { label: string; description: string; info?: ReactNode; scope?: "UI" | "Native OMP" | "Workspace"; searchId?: string; disabled?: boolean; children: ReactNode }) {
   const { t } = useI18n();
   const ref = useRef<HTMLDivElement>(null);
   const highlightId = useContext(SettingsHighlightContext);
@@ -939,6 +963,7 @@ function NativeSetting({ label, description, scope, searchId, disabled, children
       <div className="settings-card-text">
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
           <label id={labelId} htmlFor={settingId} className="settings-card-title" style={{ cursor: disabled ? "default" : "pointer" }}>{label}</label>
+          {info && <SettingInfo label={t("settingsConfig.moreInformationAbout", { label })}>{info}</SettingInfo>}
           {scope && (
             <span style={chipStyle}>
               {formatScope(scope)}
@@ -1273,13 +1298,13 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
       const trLabel = t(setting.labelKey);
       const trDesc = t(setting.descKey);
       const trSection = t(setting.sectionKey);
+      const trInfo = setting.infoKey ? t(setting.infoKey) : "";
       const localizedLabel = trLabel !== setting.labelKey ? trLabel : setting.fallbackLabel;
       const localizedDesc = trDesc !== setting.descKey ? trDesc : setting.fallbackDesc;
       const localizedSection = trSection !== setting.sectionKey ? trSection : setting.fallbackSection;
-      const haystack = `${localizedLabel} ${localizedDesc} ${localizedSection} ${setting.fallbackLabel} ${setting.fallbackDesc} ${setting.fallbackSection}`.toLowerCase();
-      if (haystack.includes(trimmedQuery)) {
-        results.push({ id: setting.id, kind: "setting", tab: setting.tab, label: localizedLabel, description: localizedDesc, scope: setting.scope, section: localizedSection });
-      }
+      const localizedInfo = setting.infoKey && trInfo !== setting.infoKey ? trInfo : setting.fallbackInfo;
+      const result = matchSettingSearch(setting, { label: localizedLabel, description: localizedDesc, section: localizedSection, info: localizedInfo }, trimmedQuery);
+      if (result) results.push(result);
     }
     return results;
   }, [trimmedQuery, t, nativeSettings?.defaultThinkingLevel]);
