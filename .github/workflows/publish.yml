@@ -4,15 +4,9 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing release tag to publish without moving it
-        required: true
-        type: string
 
 env:
-  TAG: ${{ inputs.tag || github.ref_name }}
+  TAG: ${{ github.ref_name }}
 
 permissions:
   contents: write
@@ -26,7 +20,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
-          ref: refs/tags/${{ inputs.tag || github.ref_name }}
 
       - name: Verify tag matches package version
         run: |
