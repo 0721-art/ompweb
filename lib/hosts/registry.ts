@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { getAgentDir } from "../omp/paths";
 import { revokeToolApprovalResource } from "../tool-approval-revoke";
 import type { OperationPolicy } from "../tool-access-policy";
-import { withToolPolicyLock } from "../tool-policy-lock";
+import { bumpToolPolicyGeneration, withToolPolicyLock } from "../tool-policy-lock";
 
 export interface HostRecord {
   id: string;
@@ -148,7 +148,7 @@ export class ReservedHostError extends Error {
 }
 
 export function updateHost(id: string, updates: { label?: string; agentStartPolicy?: OperationPolicy; shareCredentials?: boolean }): HostRecord {
-  return withToolPolicyLock(() => {
+  return withToolPolicyLock((lock) => {
     if (id === LOCAL_HOST_ID && (updates.agentStartPolicy !== undefined || updates.shareCredentials !== undefined)) throw new ReservedHostError();
     const hosts = readHosts();
     const host = hosts.find((h) => h.id === id);
@@ -158,6 +158,7 @@ export function updateHost(id: string, updates: { label?: string; agentStartPoli
       const policy = operationPolicy(updates.agentStartPolicy);
       if (!policy) throw new Error("Invalid agent-start policy");
       if (!policy.enabled || (host.agentStartPolicy.confirmation === "allow" && policy.confirmation === "ask")) {
+        bumpToolPolicyGeneration(lock, "ompweb.session_start");
         revokeToolApprovalResource("host", id, "ompweb.session_start");
       }
       host.agentStartPolicy = policy;

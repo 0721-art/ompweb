@@ -5,7 +5,7 @@ import { BROWSER_TRANSPORTS, type BrowserTransport, type BrowserTransportState }
 import { DEFAULT_UPLOAD_RETENTION_DAYS, isUploadRetentionDays } from "./upload-limits";
 import { isRecord } from "./type-guards";
 import { revokeCapability } from "./tool-approval-store";
-import { withToolPolicyLock } from "./tool-policy-lock";
+import { bumpToolPolicyGeneration, withToolPolicyLock } from "./tool-policy-lock";
 import {
   CAPABILITY_IDS,
   type CapabilityId,
@@ -291,7 +291,7 @@ export function saveWebServerSettings(patch: WebServerSettingsPatch): WebServerS
   const path = settingsPath();
   mkdirSync(resolve(path, ".."), { recursive: true });
   const temp = `${path}.tmp-${process.pid}-${Date.now()}`;
-  return withToolPolicyLock(() => {
+  return withToolPolicyLock((lock) => {
     try {
       const current = readWebServerSettingsFromDisk();
       const settings: WebServerSettings = {
@@ -301,7 +301,10 @@ export function saveWebServerSettings(patch: WebServerSettingsPatch): WebServerS
         browserTransport: patch.browserTransport ?? current.browserTransport,
         uploadRetentionDays: patch.uploadRetentionDays === undefined ? current.uploadRetentionDays : patch.uploadRetentionDays,
       };
-      for (const capability of capabilitiesRequiringRevocation(current.toolPolicies, settings.toolPolicies)) revokeCapability(capability);
+      for (const capability of capabilitiesRequiringRevocation(current.toolPolicies, settings.toolPolicies)) {
+        bumpToolPolicyGeneration(lock, capability);
+        revokeCapability(capability);
+      }
       writeFileSync(temp, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
       renameSync(temp, path);
       globalThis.__ompWebSettingsCache = { path, settings };

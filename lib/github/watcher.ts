@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 import { MAX_AGENT_COMMAND_REQUEST_BYTES } from "../image-attachments";
 import { hasToolCapabilityAuthorization } from "../tool-policy-runtime";
+import { currentToolPolicyGeneration } from "../tool-policy-lock";
 import { fetchSnapshot } from "./api";
 import { diffSnapshot, formatUpdate, splitUpdateEvents, updateEntryId } from "./events";
 import { checkGh, defaultGhRunner, formatTarget, GhUnavailableError, parseGithubTarget, type GhRunner } from "./gh";
 import { advanceCursor, advancePendingBatch, claimPending, closeWatchStore, commitUpdate, getPending, isPosting, listWatches, pendingBatchEntryIds, postedIds, removeSessionWatches, removeWatch, renameSession, repoKeyOf, type PendingUpdate, type Watch } from "./watch-store";
 
 const watchAllowed = (watch: Watch): boolean => {
+  if (watch.policyGeneration !== currentToolPolicyGeneration("github.read_watch")) return false;
   const target = parseGithubTarget(watch.itemKey);
   return hasToolCapabilityAuthorization("github.read_watch", watch.sessionId, "github.repository", repoKeyOf(target), watch.caller);
 };

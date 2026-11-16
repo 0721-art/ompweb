@@ -22,6 +22,7 @@ import { MAX_UPLOADS_PER_MESSAGE, UPLOAD_ID_RE } from "./upload-limits";
 import { snapshotOutboxUploads, UploadError, type OutboxUploadReceipt } from "./uploads";
 import { resolveWebAuthSecret } from "./web-auth-secret";
 import { hasToolCapabilityAuthorization, type ToolCaller } from "./tool-policy-runtime";
+import { currentToolPolicyGeneration } from "./tool-policy-lock";
 
 /** Delivered (and removed) ids answer a repeated `outbox_add` this long (spec O2: idempotent by id); the browser gives
  * up resending after 7 days, so a resend always finds its id. */
@@ -43,19 +44,20 @@ const RECEIPT_PIN_SCHEMA = "CREATE TABLE IF NOT EXISTS github_receipt_pins (sess
 const WATCH_OWNER_PREFIX = `${GITHUB_WATCH_OUTBOX_OWNER}:`;
 
 function persistedWatchOwner(authorization: { caller?: ToolCaller; repository: string }): string {
-  return `${WATCH_OWNER_PREFIX}${Buffer.from(JSON.stringify(authorization)).toString("base64url")}`;
+  return `${WATCH_OWNER_PREFIX}${Buffer.from(JSON.stringify({ ...authorization, policyGeneration: currentToolPolicyGeneration("github.read_watch") })).toString("base64url")}`;
 }
 
-function watchAuthorization(owner: string): { caller?: ToolCaller; repository: string } | null {
+function watchAuthorization(owner: string): { caller?: ToolCaller; repository: string; policyGeneration: number } | null {
   if (!owner.startsWith(WATCH_OWNER_PREFIX)) return null;
   try {
     const value: unknown = JSON.parse(Buffer.from(owner.slice(WATCH_OWNER_PREFIX.length), "base64url").toString());
-    if (!isRecord(value) || typeof value.repository !== "string" || !value.repository) return null;
+    if (!isRecord(value) || typeof value.repository !== "string" || !value.repository
+      || !Number.isSafeInteger(value.policyGeneration) || Number(value.policyGeneration) < 0) return null;
     const caller = isRecord(value.caller) ? {
       ...(typeof value.caller.agentId === "string" ? { agentId: value.caller.agentId } : {}),
       ...(typeof value.caller.modelRole === "string" ? { modelRole: value.caller.modelRole } : {}),
     } : undefined;
-    return { repository: value.repository, ...(caller && Object.keys(caller).length ? { caller } : {}) };
+    return { repository: value.repository, policyGeneration: Number(value.policyGeneration), ...(caller && Object.keys(caller).length ? { caller } : {}) };
   } catch {
     return null;
   }
@@ -63,11 +65,14 @@ function watchAuthorization(owner: string): { caller?: ToolCaller; repository: s
 
 function watchEntryAuthorized(entry: Row): boolean {
   const authorization = watchAuthorization(entry.owner);
-  return authorization !== null && hasToolCapabilityAuthorization(
-    "github.read_watch", entry.session_id, "github.repository", authorization.repository, authorization.caller,
-  );
+  return authorization !== null
+    && authorization.policyGeneration === currentToolPolicyGeneration("github.read_watch")
+    && hasToolCapabilityAuthorization(
+      "github.read_watch", entry.session_id, "github.repository", authorization.repository, authorization.caller,
+    );
 }
 
+const isWatchEntryOwner = (owner: string): boolean => owner === GITHUB_WATCH_OUTBOX_OWNER || owner.startsWith(WATCH_OWNER_PREFIX);
 /** `owner`: the web session whose uploads the entry attaches; `advisor`: the chat's spawn flag at Send. */
 interface Row {
   id: string;
@@ -949,7 +954,7 @@ function onChildExit(wrapper: AgentSessionWrapper, event: AgentEvent): void {
 type Outcome = "next" | "wait" | "offline";
 
 async function deliver(entry: Row): Promise<Outcome> {
-  if (entry.owner.startsWith(WATCH_OWNER_PREFIX) && !watchEntryAuthorized(entry)) {
+  if (isWatchEntryOwner(entry.owner) && !watchEntryAuthorized(entry)) {
     retire(entry.id, "none");
     releaseOutboxReceipt(entry.id);
     publish(entry.session_id);
@@ -965,7 +970,7 @@ async function deliver(entry: Row): Promise<Outcome> {
   const generation = priorWrapper?.getMessageCommandGeneration() ?? 0;
   const competingPending = priorWrapper?.hasPendingMessageCommands() ?? false;
   const started = await runAgentCommand(sessionId, { type: "get_state" }, entry.advisor === 1, entry.owner);
-  if (entry.owner.startsWith(WATCH_OWNER_PREFIX) && !watchEntryAuthorized(entry)) {
+  if (isWatchEntryOwner(entry.owner) && !watchEntryAuthorized(entry)) {
     retire(entry.id, "none");
     releaseOutboxReceipt(entry.id);
     publish(entry.session_id);
@@ -1054,7 +1059,7 @@ async function deliver(entry: Row): Promise<Outcome> {
       }
     }
     if (!wrapper.isAlive()) return retry(current);
-    if (current.owner.startsWith(WATCH_OWNER_PREFIX) && !watchEntryAuthorized(current)) {
+    if (isWatchEntryOwner(current.owner) && !watchEntryAuthorized(current)) {
       retire(current.id, "none");
       releaseOutboxReceipt(current.id);
       publish(current.session_id);

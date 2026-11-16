@@ -8,6 +8,7 @@ import { grant as grantApproval, has as hasApproval, removeSession as removeAppr
 import type { ItemKind } from "./api";
 import type { WatchCursor } from "./events";
 import type { ToolCaller } from "../tool-policy-runtime";
+import { currentToolPolicyGeneration } from "../tool-policy-lock";
 
 /**
  * Server-only persistent GitHub watch state in omp-web's data directory: which
@@ -28,6 +29,7 @@ export interface Watch {
   /** Registration time (ms), used to order watches. */
   createdAt: number;
   caller?: ToolCaller;
+  policyGeneration: number;
 }
 
 export interface PendingBatch {
@@ -57,9 +59,9 @@ declare global {
 }
 
 const SCHEMA = `
-CREATE TABLE IF NOT EXISTS watches (session_id TEXT NOT NULL, item_key TEXT NOT NULL, kind TEXT NOT NULL, cursor_json TEXT NOT NULL, created_at INTEGER NOT NULL, registration_id TEXT NOT NULL DEFAULT '', agent_id TEXT, model_role TEXT, PRIMARY KEY (session_id, item_key));
+CREATE TABLE IF NOT EXISTS watches (session_id TEXT NOT NULL, item_key TEXT NOT NULL, kind TEXT NOT NULL, cursor_json TEXT NOT NULL, created_at INTEGER NOT NULL, registration_id TEXT NOT NULL DEFAULT '', agent_id TEXT, model_role TEXT, policy_generation INTEGER NOT NULL DEFAULT -1, PRIMARY KEY (session_id, item_key));
 CREATE TABLE IF NOT EXISTS pending (session_id TEXT NOT NULL, item_key TEXT NOT NULL, entry_id TEXT NOT NULL, message TEXT NOT NULL, cursor_json TEXT NOT NULL, final INTEGER NOT NULL, batches_json TEXT NOT NULL DEFAULT '[]', batch_index INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (session_id, item_key));
-CREATE TABLE IF NOT EXISTS watch_intents (token TEXT NOT NULL PRIMARY KEY, session_id TEXT NOT NULL, item_key TEXT NOT NULL, agent_id TEXT, model_role TEXT);
+CREATE TABLE IF NOT EXISTS watch_intents (token TEXT NOT NULL PRIMARY KEY, session_id TEXT NOT NULL, item_key TEXT NOT NULL, agent_id TEXT, model_role TEXT, policy_generation INTEGER NOT NULL DEFAULT -1);
 CREATE INDEX IF NOT EXISTS watch_intents_session_item ON watch_intents (session_id, item_key);
 CREATE TABLE IF NOT EXISTS posted (item_key TEXT NOT NULL, comment_id TEXT NOT NULL, PRIMARY KEY (item_key, comment_id));
 CREATE TABLE IF NOT EXISTS active_posts (item_key TEXT NOT NULL, token TEXT NOT NULL PRIMARY KEY, lease_until INTEGER NOT NULL);
@@ -135,10 +137,12 @@ function open(dir: string, path: string): Database {
       if (!columns.some(({ name }) => name === "registration_id")) database.exec("ALTER TABLE watches ADD COLUMN registration_id TEXT NOT NULL DEFAULT ''");
       if (!columns.some(({ name }) => name === "agent_id")) database.exec("ALTER TABLE watches ADD COLUMN agent_id TEXT");
       if (!columns.some(({ name }) => name === "model_role")) database.exec("ALTER TABLE watches ADD COLUMN model_role TEXT");
+      if (!columns.some(({ name }) => name === "policy_generation")) database.exec("ALTER TABLE watches ADD COLUMN policy_generation INTEGER NOT NULL DEFAULT -1");
       const intentColumns = database.prepare<{ name: string }, []>("PRAGMA table_info(watch_intents)").all();
       if (!intentColumns.some(({ name }) => name === "agent_id")) database.exec("ALTER TABLE watch_intents ADD COLUMN agent_id TEXT");
       if (!intentColumns.some(({ name }) => name === "model_role")) database.exec("ALTER TABLE watch_intents ADD COLUMN model_role TEXT");
       const unregistered = database.prepare<{ session_id: string; item_key: string }, []>("SELECT session_id, item_key FROM watches WHERE registration_id = ''").all();
+      if (!intentColumns.some(({ name }) => name === "policy_generation")) database.exec("ALTER TABLE watch_intents ADD COLUMN policy_generation INTEGER NOT NULL DEFAULT -1");
       const assign = database.prepare("UPDATE watches SET registration_id = ? WHERE session_id = ? AND item_key = ? AND registration_id = ''");
       for (const watch of unregistered) assign.run(randomUUID(), watch.session_id, watch.item_key);
       const pendingColumns = database.prepare<{ name: string }, []>("PRAGMA table_info(pending)").all();
@@ -157,7 +161,7 @@ function open(dir: string, path: string): Database {
 
 // ---------------------------------------------------------------- watches
 
-type WatchRow = { session_id: string; item_key: string; kind: ItemKind; cursor_json: string; registration_id: string; created_at: number; agent_id: string | null; model_role: string | null };
+type WatchRow = { session_id: string; item_key: string; kind: ItemKind; cursor_json: string; registration_id: string; created_at: number; agent_id: string | null; model_role: string | null; policy_generation: number };
 
 const toWatch = (row: WatchRow): Watch => ({
   sessionId: row.session_id,
@@ -167,6 +171,7 @@ const toWatch = (row: WatchRow): Watch => ({
   registrationId: row.registration_id,
   createdAt: row.created_at,
   ...(row.agent_id || row.model_role ? { caller: { ...(row.agent_id ? { agentId: row.agent_id } : {}), ...(row.model_role ? { modelRole: row.model_role } : {}) } } : {}),
+  policyGeneration: row.policy_generation,
 });
 
 /** `exists` leaves the stored cursor as it is; `limit` refuses the watch beyond MAX_WATCHES_PER_SESSION. */
@@ -176,7 +181,7 @@ export function addWatch(sessionId: string, itemKey: string, kind: ItemKind, bas
     if (d.prepare("SELECT 1 FROM watches WHERE session_id = ? AND item_key = ?").get(sessionId, itemKey)) return "exists";
     const { n } = d.prepare<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM watches WHERE session_id = ?").get(sessionId)!;
     if (n >= MAX_WATCHES_PER_SESSION) return "limit";
-    d.prepare("INSERT INTO watches (session_id, item_key, kind, cursor_json, created_at, registration_id) VALUES (?, ?, ?, ?, ?, ?)").run(sessionId, itemKey, kind, JSON.stringify(baseline), Date.now(), randomUUID());
+    d.prepare("INSERT INTO watches (session_id, item_key, kind, cursor_json, created_at, registration_id, policy_generation) VALUES (?, ?, ?, ?, ?, ?, ?)").run(sessionId, itemKey, kind, JSON.stringify(baseline), Date.now(), randomUUID(), currentToolPolicyGeneration("github.read_watch"));
     return "added";
   });
 }
@@ -184,8 +189,8 @@ export function addWatch(sessionId: string, itemKey: string, kind: ItemKind, bas
 /** Records one in-flight registration so a later unwatch can invalidate it across server processes. */
 export function beginWatchIntent(sessionId: string, itemKey: string, caller?: ToolCaller): string {
   const token = randomUUID();
-  db().prepare("INSERT INTO watch_intents (token, session_id, item_key, agent_id, model_role) VALUES (?, ?, ?, ?, ?)")
-    .run(token, sessionId, itemKey, caller?.agentId ?? null, caller?.modelRole ?? null);
+  db().prepare("INSERT INTO watch_intents (token, session_id, item_key, agent_id, model_role, policy_generation) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(token, sessionId, itemKey, caller?.agentId ?? null, caller?.modelRole ?? null, currentToolPolicyGeneration("github.read_watch"));
   return token;
 }
 
@@ -206,8 +211,8 @@ export function registerWatchIntent(
 ): "added" | "exists" | "limit" | "cancelled" {
   const d = db();
   return transaction(d, () => {
-    const intent = d.prepare<{ agent_id: string | null; model_role: string | null }, [string, string, string]>(
-      "SELECT agent_id, model_role FROM watch_intents WHERE token = ? AND session_id = ? AND item_key = ?",
+    const intent = d.prepare<{ agent_id: string | null; model_role: string | null; policy_generation: number }, [string, string, string]>(
+      "SELECT agent_id, model_role, policy_generation FROM watch_intents WHERE token = ? AND session_id = ? AND item_key = ?",
     ).get(token, sessionId, itemKey);
     if (!intent) return "cancelled";
     let result: "added" | "exists" | "limit";
@@ -217,8 +222,8 @@ export function registerWatchIntent(
       const { n } = d.prepare<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM watches WHERE session_id = ?").get(sessionId)!;
       if (n >= MAX_WATCHES_PER_SESSION) result = "limit";
       else {
-        d.prepare("INSERT INTO watches (session_id, item_key, kind, cursor_json, created_at, registration_id, agent_id, model_role) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-          .run(sessionId, itemKey, kind, JSON.stringify(baseline), Date.now(), randomUUID(), intent.agent_id, intent.model_role);
+        d.prepare("INSERT INTO watches (session_id, item_key, kind, cursor_json, created_at, registration_id, agent_id, model_role, policy_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+          .run(sessionId, itemKey, kind, JSON.stringify(baseline), Date.now(), randomUUID(), intent.agent_id, intent.model_role, intent.policy_generation);
         result = "added";
       }
     }
@@ -259,7 +264,7 @@ export function removeSessionWatches(
 }
 
 export function listWatches(): Watch[] {
-  return db().prepare<WatchRow, []>("SELECT session_id, item_key, kind, cursor_json, registration_id, created_at, agent_id, model_role FROM watches ORDER BY created_at").all().map(toWatch);
+  return db().prepare<WatchRow, []>("SELECT session_id, item_key, kind, cursor_json, registration_id, created_at, agent_id, model_role, policy_generation FROM watches ORDER BY created_at").all().map(toWatch);
 }
 
 /** Commits the cursor or removes a final watch only after all persisted batches are accepted. */
