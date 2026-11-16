@@ -1991,6 +1991,8 @@ export class AgentSessionWrapper {
       const args = event.arguments && typeof event.arguments === "object" ? event.arguments as Record<string, unknown> : {};
       const getSessionId = () => this.sessionId;
       const settings = loadWebServerSettings();
+      const replaying = this.replaying;
+      const messagePermission = await readAgentMessagePermissionFromDisk();
       const clusterHostIds = new Set<string>(toolName === "send_to_session" ? loadPools()[0]?.members.map((member) => member.hostId) ?? [] : []);
       const context: AgentToolContext = {
         get sourceSessionId() { return getSessionId(); },
@@ -1998,16 +2000,16 @@ export class AgentSessionWrapper {
         sourceCwd: this.cwd,
         sourceHostId: this.host.id,
         enabled: settings.agentToolsEnabled,
-        messagePermission: await readAgentMessagePermissionFromDisk(),
+        messagePermission,
         clusterHostIds,
         guard: getAgentToolGuard(),
         confirm: (title) => this.confirmFromServer(title, cancel.signal),
         signal: cancel.signal,
       };
-      if (this.replaying && toolName === "new_session" && (
+      if (replaying && toolName === "new_session" && (
         args.shareWorkspace === true || args.host != null || !poolProjectBindings(loadPools()).get(this.host.id)?.size
       )) throw new Error(AGENT_TOOL_UNKNOWN_OUTCOME);
-      const result = await executeAgentTool(toolName, args, createAgentToolOps(context, this.replaying), context);
+      const result = await executeAgentTool(toolName, args, createAgentToolOps(context, replaying), context);
       sendToolResult(typeof result === "string" ? result : JSON.stringify(result));
     } catch (error) {
       if (error instanceof PoolStartError) {
