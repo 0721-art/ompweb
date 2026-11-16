@@ -3186,6 +3186,7 @@ export class AgentSessionWrapper {
                   capabilityLabel: "open browser URLs",
                   resourceType: "url.origin",
                   resourceKey: pending.openUrl.origin,
+                  caller: pending.openUrl.caller,
                 }, currentSessionId, claim.sessionId, claim.generation, claim.approvalGeneration, claim.grantApprovalGeneration, claim.approvalClearGeneration,
                 () => this.pendingHostTools.get(id) === pending && pending.openUrl?.claim === claim);
               }

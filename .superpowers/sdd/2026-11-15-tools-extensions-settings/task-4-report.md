@@ -198,3 +198,15 @@ Verification:
 - Full `npm run lint` — fails on unused `MAX_AGENT_COMMAND_REQUEST_BYTES` (`lib/github/watcher.test.mjs:14:9`) and `writeFileSync` (`lib/tool-policy-runtime.test.mjs:2:31`); 7 existing `react-hooks/exhaustive-deps` warnings remain at `components/AppShell.tsx:361,828,845,856,925`, `components/RecordingDeck.tsx:199` and `hooks/useDictation.ts:822`.
 - `bun test --parallel --timeout 30000 lib/rpc-manager.test.mjs lib/tool-policy-runtime.test.mjs lib/tool-approval-store.test.mjs app/api/tool-approvals/route.test.mjs hooks/useAgentSession.rpc.test.mjs hooks/useAgentSession-stream.local-file.test.mjs lib/event-stream-protocol.test.mjs lib/browser-link.test.mjs lib/agent-client.test.mjs` — 572 pass, 0 fail across 8 files.
 
+## Task 4E: scoped caller grant promotion
+
+- Restored the pending `open_url` caller provenance when promoting a successful claimed request, so global allow plus an agent-scoped ask remembers the confirmed origin grant under the authoritative scoped policy.
+- Added wrapper regression coverage proving the first confirmed same-origin request promotes the grant and the second request is authorized without another confirmation.
+
+Verification:
+
+- RED: `bun test --timeout 30000 lib/rpc-manager.test.mjs --test-name-pattern 'successful open_url confirmation remembers a scoped caller grant'` — 0 pass, 1 fail (`confirmation_required` instead of `authorized` on the second request).
+- Focused regression — 1 pass, 0 fail.
+- `bun test --timeout 30000 lib/rpc-manager.test.mjs` — 165 pass, 0 fail.
+- `npm run typecheck` — pass.
+- `npx eslint lib/rpc-manager.ts lib/rpc-manager.test.mjs` — pass.
