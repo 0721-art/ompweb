@@ -411,6 +411,7 @@ export async function executeAgentTool(
       throw new Error(`The user declined to send a message to session ${sessionId}.`);
     }
   }
+  if (ctx.signal?.aborted) throw new Error("The agent tool call was cancelled before the message was sent.");
   const result = await ops.deliver({
     sessionId,
     message: formatAttributedMessage(ctx.sourceSessionId, message),

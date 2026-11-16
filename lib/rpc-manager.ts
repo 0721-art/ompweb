@@ -1991,7 +1991,7 @@ export class AgentSessionWrapper {
       const args = event.arguments && typeof event.arguments === "object" ? event.arguments as Record<string, unknown> : {};
       const getSessionId = () => this.sessionId;
       const settings = loadWebServerSettings();
-      const clusterHostIds = new Set(loadPools()[0]?.members.map((member) => member.hostId) ?? []);
+      const clusterHostIds = new Set<string>(toolName === "send_to_session" ? loadPools()[0]?.members.map((member) => member.hostId) ?? [] : []);
       const context: AgentToolContext = {
         get sourceSessionId() { return getSessionId(); },
         sourceRequestId: id,

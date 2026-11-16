@@ -77,13 +77,17 @@ test("agent message approval shows unavailable instead of inventing a policy whi
 });
 
 test("an uncertain agent message approval save reloads the committed policy", async (t) => {
-  let loads = 0;
+  let saveAttempted = false;
+  let loadsAfterSave = 0;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     if (String(url) !== "/api/web-settings") return Response.json({});
-    if (init?.method === "PUT") throw new TypeError("Failed to fetch");
-    loads++;
-    return Response.json({ agentMessagePermission: loads === 1 ? "alwaysAsk" : "trustCluster" });
+    if (init?.method === "PUT") {
+      saveAttempted = true;
+      throw new TypeError("Failed to fetch");
+    }
+    if (saveAttempted) loadsAfterSave++;
+    return Response.json({ agentMessagePermission: saveAttempted ? "trustCluster" : "alwaysAsk" });
   };
   t.after(() => {
     cleanup();
@@ -94,7 +98,8 @@ test("an uncertain agent message approval save reloads the committed policy", as
   await settle();
   const select = within(container).getByRole("combobox", { name: "Agent message approval" });
   await choose(select, "Trust cluster");
-  assert.ok(loads > 1);
+  assert.equal(saveAttempted, true);
+  assert.ok(loadsAfterSave > 0);
   assert.equal(select.disabled, false);
   assert.equal(select.textContent, "Trust cluster");
 });
