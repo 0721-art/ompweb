@@ -1895,6 +1895,7 @@ async function loadOutbox(db: IDBDatabase | null): Promise<boolean> {
     recordOutbox("read", { id: "", sessionId: "", mode: "prompt" }, { error: "IndexedDB read failed" });
     return false;
   }
+  outboxPartial = false;
   for (const entry of stored) outboxItems.set(entry.id, { entry, inFlight: false, retryTimer: undefined, retryMs: RECONNECT_MIN_MS });
   await Promise.all([...new Set(stored.map((entry) => entry.sessionId))].map((sessionId) => sendOutbox(sessionId)));
   return true;
@@ -2227,7 +2228,16 @@ async function outboxAnswer(item: OutboxItem, status: number, body: unknown): Pr
           store.delete(entry.id);
         }
       };
-    }))) return outboxAnswer(item, 0, null);
+    }))) {
+      item.inFlight = false;
+      item.retryTimer = setTimeout(() => {
+        item.retryTimer = undefined;
+        sendOutbox(sessionId);
+      }, item.retryMs);
+      item.retryMs = Math.min(item.retryMs * 2, RECONNECT_MAX_MS);
+      recordOutbox("retry", item.entry, { status: httpStatus, error: "IndexedDB write failed" });
+      return;
+    }
     recordOutbox("accepted", item.entry, { status });
     for (const removedId of removedIds) {
       clearTimeout(outboxItems.get(removedId)?.retryTimer);
