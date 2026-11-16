@@ -4,6 +4,7 @@ import { join } from "path";
 import { Database } from "bun:sqlite";
 import { getAgentDir } from "../omp/paths";
 import { isRecord } from "../type-guards";
+import { grant as grantApproval, has as hasApproval, removeSession as removeApprovalSession, renameSession as renameApprovalSession } from "../tool-approval-store";
 import type { ItemKind } from "./api";
 import type { WatchCursor } from "./events";
 
@@ -11,8 +12,8 @@ import type { WatchCursor } from "./events";
  * Server-only persistent GitHub watch state in omp-web's data directory: which
  * session watches which item, the cursor each watch has reported up to, the
  * update a watch is about to post (so a crash re-adds the same outbox entry),
- * the comments the agent posted, and the read grants. Every omp-web instance
- * sharing the agent directory shares it; SQLite serializes their writes.
+ * the comments the agent posted. Every omp-web instance sharing the agent
+ * directory shares it; SQLite serializes their writes.
  */
 
 export const MAX_WATCHES_PER_SESSION = 20;
@@ -59,7 +60,6 @@ CREATE TABLE IF NOT EXISTS pending (session_id TEXT NOT NULL, item_key TEXT NOT 
 CREATE TABLE IF NOT EXISTS watch_intents (token TEXT NOT NULL PRIMARY KEY, session_id TEXT NOT NULL, item_key TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS watch_intents_session_item ON watch_intents (session_id, item_key);
 CREATE TABLE IF NOT EXISTS posted (item_key TEXT NOT NULL, comment_id TEXT NOT NULL, PRIMARY KEY (item_key, comment_id));
-CREATE TABLE IF NOT EXISTS read_grants (session_id TEXT NOT NULL, repo_key TEXT NOT NULL, PRIMARY KEY (session_id, repo_key));
 CREATE TABLE IF NOT EXISTS active_posts (item_key TEXT NOT NULL, token TEXT NOT NULL PRIMARY KEY, lease_until INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS active_posts_item_lease ON active_posts (item_key, lease_until);
 `;
@@ -225,11 +225,12 @@ export function removeWatch(sessionId: string, itemKey: string): boolean {
   });
 }
 
-/** The session is gone: its watches, pending updates and read grants go. */
+/** The session is gone: its watches and pending updates go with its approvals. */
 export function removeSessionWatches(
   sessionId: string,
   expected?: { itemKey: string; registrationId: string; entryId?: string },
 ): void {
+  if (!expected) removeApprovalSession(sessionId);
   const d = existingDb();
   if (!d) return;
   transaction(d, () => {
@@ -242,7 +243,7 @@ export function removeSessionWatches(
     d.prepare("DELETE FROM watch_intents WHERE session_id = ?").run(sessionId);
     d.prepare("DELETE FROM pending WHERE session_id = ?").run(sessionId);
     d.prepare("DELETE FROM watches WHERE session_id = ?").run(sessionId);
-    d.prepare("DELETE FROM read_grants WHERE session_id = ?").run(sessionId);
+    if (expected) removeApprovalSession(sessionId);
   });
 }
 
@@ -426,20 +427,21 @@ export function postedIds(itemKey: string): Set<string> {
 // ---------------------------------------------------------------- read grants
 
 export function hasReadGrant(sessionId: string, repoKey: string): boolean {
-  return db().prepare("SELECT 1 FROM read_grants WHERE session_id = ? AND repo_key = ?").get(sessionId, repoKey) !== null;
+  return hasApproval(sessionId, "github.repository", repoKey, "github.read_watch");
 }
 
 export function grantRead(sessionId: string, repoKey: string): void {
-  db().prepare("INSERT OR IGNORE INTO read_grants (session_id, repo_key) VALUES (?, ?)").run(sessionId, repoKey);
+  grantApproval(sessionId, "github.repository", repoKey, "github.read_watch");
 }
 
 /**
  * A session move: the moved session's watches replace any the new id already
- * holds for the same items, and keep their pending updates; read grants the
- * new id already has are kept. Pending rows whose watch is not moving stay behind.
+ * holds for the same items and keep their pending updates. Pending rows whose
+ * watch is not moving stay behind.
  */
 export function renameSession(oldId: string, newId: string): void {
   if (oldId === newId) return;
+  renameApprovalSession(oldId, newId);
   const d = existingDb();
   if (!d) return;
   transaction(d, () => {
@@ -451,7 +453,5 @@ export function renameSession(oldId: string, newId: string): void {
     d.prepare(`UPDATE OR REPLACE pending SET session_id = ? WHERE session_id = ? AND item_key IN (${movedItems})`).run(newId, oldId, oldId);
     d.prepare("DELETE FROM pending WHERE session_id = ?").run(oldId);
     d.prepare("UPDATE watches SET session_id = ? WHERE session_id = ?").run(newId, oldId);
-    d.prepare("UPDATE OR IGNORE read_grants SET session_id = ? WHERE session_id = ?").run(newId, oldId);
-    d.prepare("DELETE FROM read_grants WHERE session_id = ?").run(oldId);
   });
 }

@@ -5,6 +5,7 @@ import { getAgentDir } from "./omp/paths";
 import { BROWSER_TRANSPORTS, type BrowserTransport, type BrowserTransportState } from "./event-stream-protocol";
 import { DEFAULT_UPLOAD_RETENTION_DAYS, isUploadRetentionDays } from "./upload-limits";
 import { isRecord } from "./type-guards";
+import { revokeCapability } from "./tool-approval-store";
 import {
   CAPABILITY_IDS,
   type CapabilityId,
@@ -304,6 +305,27 @@ function mergeToolPolicies(current: ToolPolicies, patch: ToolPoliciesPatch | und
     agents: mergeScopedPolicies(current.agents, patch.agents),
   };
 }
+
+function capabilitiesRequiringRevocation(current: ToolPolicies, next: ToolPolicies): CapabilityId[] {
+  const revoked = new Set<CapabilityId>();
+  const changed = (capability: CapabilityId, before: OperationPolicy | undefined, after: OperationPolicy | undefined) => {
+    if (before?.enabled === after?.enabled && before?.confirmation === after?.confirmation) return;
+    if (after?.enabled === false
+      || (before === undefined && after?.enabled === true && after.confirmation === "ask")
+      || (before?.enabled === true && before.confirmation === "allow" && (after?.enabled !== true || after.confirmation !== "allow"))) {
+      revoked.add(capability);
+    }
+  };
+  for (const capability of CAPABILITY_IDS) changed(capability, current.global[capability], next.global[capability]);
+  for (const kind of ["modelRoles", "agents"] as const) {
+    for (const scope of new Set([...Object.keys(current[kind]), ...Object.keys(next[kind])])) {
+      for (const capability of CAPABILITY_IDS) {
+        changed(capability, current[kind][scope]?.[capability], next[kind][scope]?.[capability]);
+      }
+    }
+  }
+  return [...revoked];
+}
 /** Atomic write (temp file + rename), like the project registry. Private to its user: it holds agentEnv. */
 export function saveWebServerSettings(patch: WebServerSettingsPatch): WebServerSettings {
   for (const legacy of ["agentToolsEnabled", "githubWritesUnasked", "githubActionsPermissions"]) {
@@ -328,6 +350,9 @@ export function saveWebServerSettings(patch: WebServerSettingsPatch): WebServerS
       browserTransport: patch.browserTransport ?? current.browserTransport,
       uploadRetentionDays: patch.uploadRetentionDays === undefined ? current.uploadRetentionDays : patch.uploadRetentionDays,
     };
+    // Grants cannot retain caller-scope provenance, so a narrowing scope revokes
+    // the capability globally. Revoke first: a failure must leave policy unchanged.
+    for (const capability of capabilitiesRequiringRevocation(current.toolPolicies, settings.toolPolicies)) revokeCapability(capability);
     writeFileSync(temp, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     renameSync(temp, path);
     globalThis.__ompWebSettingsCache = { path, settings };

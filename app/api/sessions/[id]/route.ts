@@ -6,6 +6,7 @@ import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-fo
 import { clearExitedRpcSession, getLiveRpcSessionIds, getRpcSession, WebRpcError } from "@/lib/rpc-manager";
 import { forgetSessionReplacementMappings } from "@/lib/message-outbox";
 import { removeSessionWatches } from "@/lib/github/watch-store";
+import { removeSession as removeSessionApprovals } from "@/lib/tool-approval-store";
 
 /** Stable, client-safe error body for catch-all handlers: details go to the
  *  server log only, never to the browser. */
@@ -134,6 +135,8 @@ export async function DELETE(
     if (!live?.hostOwnedLifecycle) await live?.destroyAndWait?.("delete", true);
     // Live children are skipped by the re-parent rewrite: their omp process
     // owns the file and would clobber it on its next flush.
+    // Revoke before deletion so a cleanup failure cannot leave usable stale authority.
+    removeSessionApprovals(id);
     const result = await resolved.host.sessionOps.deleteSession(id, getLiveRpcSessionIds());
     if (!result.ok) return opErrorResponse(result);
     // Remove only this deleted session's content-free retry-lineage metadata.
