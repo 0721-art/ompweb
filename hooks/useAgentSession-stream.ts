@@ -318,6 +318,29 @@ export function isSafeOpenUrl(raw: unknown): boolean {
   return scheme === "http" || scheme === "https" || scheme === "mailto";
 }
 
+/** Open through a same-origin blank window so success is observable before isolating and navigating it. */
+export function openUrlInIsolatedWindow(url: string): boolean {
+  const popup = window.open("about:blank", "_blank");
+  if (!popup) return false;
+  try {
+    popup.opener = null;
+    const referrer = popup.document.createElement("meta");
+    referrer.name = "referrer";
+    referrer.content = "no-referrer";
+    popup.document.head.append(referrer);
+    popup.focus();
+    popup.location.replace(url);
+    return true;
+  } catch {
+    popup.close();
+    return false;
+  }
+}
+
+export function formatOpenUrlConfirmation(origin: string, sessionId: string): string {
+  return `Allow browser.open_url to open ${origin} for session ${sessionId}? This approval is remembered only for this session's lifetime.`;
+}
+
 export interface HostToolHandlers {
   /**
    * For confirmationRequired, resolve whether the user confirmed without opening.
@@ -372,7 +395,7 @@ export async function runHostTool(
   sessionId: string | undefined,
   signal?: AbortSignal,
   openUrlAuthorization?: unknown,
-): Promise<{ text: string; isError: boolean; openUrl?: string; authorizeOpenUrl?: true }> {
+): Promise<{ text: string; isError: boolean; openUrl?: string; claimOpenUrl?: true }> {
   const str = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
   const canceled = { text: "Host tool request canceled", isError: true };
   if (signal?.aborted) return canceled;
@@ -392,7 +415,7 @@ export async function runHostTool(
         text: `Ready to open ${raw}`,
         isError: false,
         openUrl: raw,
-        ...(confirmationRequired ? { authorizeOpenUrl: true as const } : {}),
+        claimOpenUrl: true,
       };
     }
     case "notify": {

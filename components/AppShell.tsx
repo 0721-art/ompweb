@@ -78,7 +78,7 @@ import {
   WorkspaceState,
 } from "./AppShell-layout";
 import type { CrossSessionHostToolCall, ManagedProject, SessionInfo, SessionTreeNode } from "@/lib/types";
-import { runHostTool } from "@/hooks/useAgentSession-stream";
+import { formatOpenUrlConfirmation, openUrlInIsolatedWindow, runHostTool } from "@/hooks/useAgentSession-stream";
 import { sendAgentCommand } from "@/lib/agent-client";
 import { openEventStream } from "@/lib/event-stream";
 import { randomUUID } from "@/lib/random-uuid";
@@ -1589,7 +1589,7 @@ export function AppShell({ appName }: { appName: string }) {
   // existing host-tool callback until the user answers this dialog.
   const [pendingOpens, setPendingOpens] = useState<Array<{
     target: string; name: string; sessionId: string; crossSession: boolean;
-  } & ({ kind: "url"; finish: (confirmed: boolean) => void } | { kind: "file"; source: WorkspaceFileSource })>>([]);
+  } & ({ kind: "url"; origin: string; finish: (confirmed: boolean) => void } | { kind: "file"; source: WorkspaceFileSource })>>([]);
   const pendingOpen = pendingOpens[0] ?? null;
   // Keep the last request on screen while the dialog animates closed.
   const shownOpenRef = useRef(pendingOpen);
@@ -1607,11 +1607,7 @@ export function AppShell({ appName }: { appName: string }) {
     confirmationRequired: boolean,
     signal?: AbortSignal,
   ): Promise<boolean> => {
-    if (!confirmationRequired) {
-      const opened = window.open(url, "_blank", "noopener,noreferrer");
-      opened?.focus?.();
-      return Promise.resolve(opened !== null);
-    }
+    if (!confirmationRequired) return Promise.resolve(openUrlInIsolatedWindow(url));
     const { promise, resolve } = Promise.withResolvers<boolean>();
     let settled = false;
     const finish = (confirmed: boolean) => {
@@ -1625,7 +1621,7 @@ export function AppShell({ appName }: { appName: string }) {
       finish(false);
     };
     const entry: Extract<(typeof pendingOpens)[number], { kind: "url" }> = {
-      kind: "url", target: url, name: url, sessionId, crossSession, finish,
+      kind: "url", target: url, origin: new URL(url).origin, name: url, sessionId, crossSession, finish,
     };
     if (signal?.aborted) abort();
     else {
@@ -1639,12 +1635,13 @@ export function AppShell({ appName }: { appName: string }) {
     confirmationRequired: boolean,
     signal?: AbortSignal,
   ) => requestOpenUrl(url, selectedSession?.id ?? "", false, confirmationRequired, signal), [requestOpenUrl, selectedSession?.id]);
-  const pendingCrossHostToolsRef = useRef(new Map<string, AbortController>());
+  const pendingCrossHostToolsRef = useRef(new Map<string, { controller: AbortController; claimId?: string }>());
   const handleCrossSessionHostTool = useCallback(async (call: CrossSessionHostToolCall) => {
     const key = JSON.stringify([call.sessionId, call.id]);
     if (pendingCrossHostToolsRef.current.has(key)) return;
-    const controller = new AbortController();
-    pendingCrossHostToolsRef.current.set(key, controller);
+    const pending = { controller: new AbortController(), claimId: undefined as string | undefined };
+    const controller = pending.controller;
+    pendingCrossHostToolsRef.current.set(key, pending);
     // Full-page Settings hides the chat, so its session counts as not viewed.
     const viewing = () => call.sessionId === activeSessionIdRef.current && !activeSettingsTabRef.current;
 
@@ -1662,10 +1659,12 @@ export function AppShell({ appName }: { appName: string }) {
       }, call.sessionId, controller.signal, call.openUrlAuthorization);
       if (controller.signal.aborted) return;
       if (result.openUrl) {
-        if (result.authorizeOpenUrl) {
-          await sendAgentCommand(call.sessionId, { type: "authorize_open_url", id: call.id });
-          if (controller.signal.aborted) return;
-        }
+        if (!result.claimOpenUrl) throw new Error("Browser URL claim was not requested.");
+        pending.claimId = randomUUID();
+        const claim = await sendAgentCommand<{ token?: unknown }>(call.sessionId, {
+          type: "authorize_open_url", id: call.id, claimId: pending.claimId,
+        });
+        if (controller.signal.aborted || typeof claim?.token !== "string") return;
         let opened = false;
         try {
           opened = await openUrl(result.openUrl, false, controller.signal);
@@ -1676,6 +1675,7 @@ export function AppShell({ appName }: { appName: string }) {
         await sendAgentCommand(call.sessionId, {
           type: "host_tool_result",
           id: call.id,
+          openUrlToken: claim.token,
           isError: !opened,
           result: { content: [{ type: "text", text: opened ? `Opened ${result.openUrl}` : `The browser did not open ${result.openUrl}` }] },
         });
@@ -1704,7 +1704,8 @@ export function AppShell({ appName }: { appName: string }) {
       try {
         const call = JSON.parse(e.data);
         if (call.type === "host_tool_cancel" && typeof call.sessionId === "string" && typeof call.targetId === "string") {
-          pending.get(JSON.stringify([call.sessionId, call.targetId]))?.abort();
+          const request = pending.get(JSON.stringify([call.sessionId, call.targetId]));
+          if (request && (typeof call.claimId !== "string" || call.claimId !== request.claimId)) request.controller.abort();
         } else if (call.type === "host_tool_call" && call.sessionId && call.id && call.toolName
           && typeof call.hostId === "string" && typeof call.cwd === "string") {
           void crossSessionHostToolRef.current(call);
@@ -1714,9 +1715,9 @@ export function AppShell({ appName }: { appName: string }) {
       }
     };
     // A drop loses the server-side subscription, and with it the calls routed to this tab (rejectCrossSessionHostTools).
-    source.onerror = () => { for (const controller of pending.values()) controller.abort(); };
+    source.onerror = () => { for (const request of pending.values()) request.controller.abort(); };
     return () => {
-      for (const controller of pending.values()) controller.abort();
+      for (const request of pending.values()) request.controller.abort();
       source.close();
     };
   }, []);
@@ -2003,7 +2004,9 @@ export function AppShell({ appName }: { appName: string }) {
         open={pendingOpen !== null}
         onOpenChange={(open) => { if (!open) finishPendingOpen(false); }}
         title={t(shownOpen?.kind === "file" ? "appShell.openFileTitle" : shownOpen?.crossSession ? "appShell.openUrlTitle" : "appShell.openUrlSameSessionTitle")}
-        description={t(shownOpen?.crossSession ? "appShell.openUrlDescription" : "appShell.openUrlSameSessionDescription", { url: shownOpen?.target ?? "" })}
+        description={shownOpen?.kind === "url"
+          ? formatOpenUrlConfirmation(shownOpen.origin, shownOpen.sessionId)
+          : t("appShell.openUrlDescription", { url: shownOpen?.target ?? "" })}
         confirmLabel={t("appShell.openUrlConfirm")}
         cancelLabel={t("appShell.openUrlCancel")}
         onConfirm={() => {

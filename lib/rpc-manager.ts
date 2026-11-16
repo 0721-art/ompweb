@@ -21,7 +21,7 @@ import {
   type AgentToolSessionOps,
 } from "./agent-tools";
 import type { AgentToolHost } from "./agent-tool-hosts";
-import { confirmToolCapability, resolveDeferredToolAuthorization, revokeConfirmedToolCapability, validateToolCaller, type DeferredToolAuthorization, type ToolCaller } from "./tool-policy-runtime";
+import { claimDeferredToolAuthorization, promoteClaimedToolApproval, resolveDeferredToolAuthorization, validateToolCaller, type DeferredToolAuthorization, type ToolCaller } from "./tool-policy-runtime";
 import type { CapabilityId } from "./tool-access-policy";
 import { createGithubToolOps, GITHUB_REPLAY_SAFE_TOOLS, GITHUB_TOOL_NAMES } from "./github/tools";
 import { markShuttingDown, recordRunningSessions, resumeOnHostLink, takeInterruptedSessions, type InterruptibleSession } from "./session-resume";
@@ -140,8 +140,9 @@ const AGENT_TOOL_UNKNOWN_OUTCOME = "omp-web restarted while this ran; the outcom
 const GITHUB_UNKNOWN_OUTCOME = "omp-web restarted while this ran; the outcome is unknown. Inspect workflow runs with github_run_list or github_read; inspect comments or threads with github_read for other writes. Do not automatically repeat a dispatch or rerun.";
 /** A GitHub write is checked on GitHub, not in the session list. */
 const unknownOutcome = (toolName: unknown) => (typeof toolName === "string" && GITHUB_TOOL_NAMES.has(toolName) ? GITHUB_UNKNOWN_OUTCOME : AGENT_TOOL_UNKNOWN_OUTCOME);
+const OPEN_URL_CLAIM_TTL_MS = 60_000;
 
-function openUrlOrigin(event: UnsequencedAgentEvent): string {
+function parseOpenUrl(event: UnsequencedAgentEvent): URL {
   const args = isRecord(event.arguments) ? event.arguments : {};
   if (typeof args.url !== "string") throw new Error("A browser URL is required.");
   let url: URL;
@@ -151,7 +152,7 @@ function openUrlOrigin(event: UnsequencedAgentEvent): string {
     throw new Error("The browser URL is invalid.");
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Only http(s) browser URLs may be opened.");
-  return url.origin;
+  return url;
 }
 
 /**
@@ -536,11 +537,19 @@ export class AgentSessionWrapper {
     event: UnsequencedAgentEvent;
     crossSessionId?: string;
     openUrl?: {
+      href: string;
       origin: string;
       caller?: ToolCaller;
       authorization: DeferredToolAuthorization;
-      confirmed?: boolean;
-      grantSessionId?: string;
+      generation: number;
+      claim?: {
+        claimId: string;
+        token: string;
+        sessionId: string;
+        generation: number;
+        rememberOnSuccess: boolean;
+        expiresAt: number;
+      };
     };
   }>();
   /** Server-side agent tool calls in flight (answerServerAgentTool); host_tool_cancel aborts them. */
@@ -1410,21 +1419,28 @@ export class AgentSessionWrapper {
         // answer.
         if (id && toolName && (this.hostToolNames.has(toolName) || this.hostToolsUnknown)) {
           let routedEvent = event;
-          let openUrl: { origin: string; caller?: ToolCaller; authorization: DeferredToolAuthorization } | undefined;
+          let openUrl: {
+            href: string;
+            origin: string;
+            caller?: ToolCaller;
+            authorization: DeferredToolAuthorization;
+            generation: number;
+          } | undefined;
           if (toolName === "open_url") {
             try {
-              const origin = openUrlOrigin(event);
+              const url = parseOpenUrl(event);
               const caller = validateToolCaller(event.caller);
-              const authorization = resolveDeferredToolAuthorization({
+              const resolution = resolveDeferredToolAuthorization({
                 capability: "browser.open_url",
                 sessionId: () => this.sessionId,
                 capabilityLabel: "open browser URLs",
                 resourceType: "url.origin",
-                resourceKey: origin,
+                resourceKey: url.origin,
                 caller,
               });
-              openUrl = { origin, caller, authorization };
-              routedEvent = { ...event, openUrlAuthorization: authorization };
+              openUrl = { href: url.href, origin: url.origin, caller, ...resolution };
+              const args = isRecord(event.arguments) ? event.arguments : {};
+              routedEvent = { ...event, arguments: { ...args, url: url.href }, openUrlAuthorization: resolution.authorization };
             } catch (error) {
               this.rejectBrowserOpenUrl(event, error);
               return;
@@ -1666,28 +1682,11 @@ export class AgentSessionWrapper {
     });
   }
 
-  private revokePendingOpenUrlGrant(
-    id: string,
-    pending: { openUrl?: { origin: string; caller?: ToolCaller; grantSessionId?: string } },
-  ): void {
-    const openUrl = pending.openUrl;
-    if (!openUrl?.grantSessionId) return;
-    revokeConfirmedToolCapability({
-      capability: "browser.open_url",
-      sessionId: () => this.sessionId,
-      capabilityLabel: "open browser URLs",
-      resourceType: "url.origin",
-      resourceKey: openUrl.origin,
-      caller: openUrl.caller,
-    }, openUrl.grantSessionId, () => this.pendingHostTools.get(id) === pending);
-    delete openUrl.grantSessionId;
-  }
 
   /** Withdraw the browser operation using the identity under which it was delivered. */
   private cancelPendingHostTool(id: string): boolean {
     const pending = this.pendingHostTools.get(id);
     if (!pending) return false;
-    this.revokePendingOpenUrlGrant(id, pending);
     this.pendingHostTools.delete(id);
     this.unparkHostTool(id);
     const event = { type: "host_tool_cancel", targetId: id };
@@ -1728,7 +1727,13 @@ export class AgentSessionWrapper {
   private parkHostTool(
     id: string,
     event: UnsequencedAgentEvent,
-    openUrl?: { origin: string; caller?: ToolCaller; authorization: DeferredToolAuthorization },
+    openUrl?: {
+      href: string;
+      origin: string;
+      caller?: ToolCaller;
+      authorization: DeferredToolAuthorization;
+      generation: number;
+    },
   ): void {
     this.pendingHostTools.set(id, { event, openUrl });
     const timer = setTimeout(() => {
@@ -3045,22 +3050,38 @@ export class AgentSessionWrapper {
 
       case "authorize_open_url": {
         const id = typeof command.id === "string" ? command.id : "";
+        const claimId = typeof command.claimId === "string" && command.claimId.length <= 128 ? command.claimId : "";
         const pending = id ? this.pendingHostTools.get(id) : undefined;
-        if (!pending?.openUrl || pending.openUrl.authorization !== "confirmation_required" || pending.openUrl.confirmed) {
-          throw new Error("No matching pending browser URL confirmation.");
+        if (!pending?.openUrl || !claimId || pending.openUrl.claim) {
+          throw new Error("No matching unclaimed pending browser URL request.");
         }
         try {
-          const approval = confirmToolCapability({
+          const claimed = claimDeferredToolAuthorization({
             capability: "browser.open_url",
             sessionId: () => this.sessionId,
             capabilityLabel: "open browser URLs",
             resourceType: "url.origin",
             resourceKey: pending.openUrl.origin,
             caller: pending.openUrl.caller,
-          }, () => this.pendingHostTools.get(id) === pending);
-          pending.openUrl.confirmed = true;
-          if (approval.granted) pending.openUrl.grantSessionId = approval.sessionId;
-          return null;
+          }, pending.openUrl.generation, pending.openUrl.authorization === "confirmation_required",
+          () => this.pendingHostTools.get(id) === pending && !pending.openUrl?.claim);
+          const token = randomUUID();
+          pending.openUrl.claim = {
+            claimId,
+            token,
+            sessionId: claimed.sessionId,
+            generation: claimed.generation,
+            rememberOnSuccess: claimed.rememberOnSuccess,
+            expiresAt: Date.now() + OPEN_URL_CLAIM_TTL_MS,
+          };
+          const withdrawn = { type: "host_tool_cancel" as const, targetId: id, claimId };
+          this.emit(withdrawn);
+          if (pending.crossSessionId !== undefined) {
+            for (const listener of getHostToolListeners()) {
+              try { listener({ ...withdrawn, sessionId: pending.crossSessionId }); } catch { /* isolate listeners */ }
+            }
+          }
+          return { token };
         } catch (error) {
           this.pendingHostTools.delete(id);
           this.unparkHostTool(id);
@@ -3071,20 +3092,40 @@ export class AgentSessionWrapper {
 
       case "host_tool_result": {
         const id = typeof command.id === "string" ? command.id : "";
+        const token = typeof command.openUrlToken === "string" ? command.openUrlToken : undefined;
         const pending = id ? this.pendingHostTools.get(id) : undefined;
-        if (pending?.openUrl?.authorization === "confirmation_required"
-          && command.isError !== true && !pending.openUrl.confirmed) {
-          this.pendingHostTools.delete(id);
-          this.unparkHostTool(id);
-          const error = new Error("The browser URL was not authorized through its pending confirmation.");
-          this.rejectBrowserOpenUrl(pending.event, error);
-          throw error;
+        if (token !== undefined && !pending?.openUrl) throw new Error("No matching pending browser URL claim.");
+        if (pending?.openUrl) {
+          const claim = pending.openUrl.claim;
+          if (claim) {
+            if (token !== claim.token) throw new Error("The browser URL claim token is invalid.");
+            if (Date.now() > claim.expiresAt) {
+              this.pendingHostTools.delete(id);
+              this.unparkHostTool(id);
+              const error = new Error("The browser URL claim token expired.");
+              this.rejectBrowserOpenUrl(pending.event, error);
+              throw error;
+            }
+            if (command.isError !== true && claim.rememberOnSuccess) {
+              promoteClaimedToolApproval({
+                capability: "browser.open_url",
+                sessionId: claim.sessionId,
+                capabilityLabel: "open browser URLs",
+                resourceType: "url.origin",
+                resourceKey: pending.openUrl.origin,
+                caller: pending.openUrl.caller,
+              }, claim.sessionId, claim.generation,
+              () => this.pendingHostTools.get(id) === pending && pending.openUrl?.claim === claim);
+            }
+          } else if (command.isError !== true || token !== undefined) {
+            throw new Error("The browser URL request has not been claimed.");
+          }
         }
-        if (pending?.openUrl && command.isError === true) this.revokePendingOpenUrlGrant(id, pending);
         if (id) {
           this.pendingHostTools.delete(id);
           this.unparkHostTool(id);
         }
+        delete command.openUrlToken;
         this.proc.sendFrame(command as { type: string; [key: string]: unknown });
         return null;
       }

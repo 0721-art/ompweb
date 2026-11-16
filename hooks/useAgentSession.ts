@@ -77,6 +77,7 @@ import {
   noticeReducer,
 } from "./useAgentSession-notices";
 import type { NoticeType } from "./useAgentSession-notices";
+import { randomUUID } from "@/lib/random-uuid";
 import {
   AGENT_STATE_RECONCILE_MS,
   WITHDRAW_BEFORE_ABORT_MS,
@@ -101,6 +102,7 @@ import {
   extractMessageText,
   historyEntryToSubagentInfo,
   isQuotaLikeError,
+  openUrlInIsolatedWindow,
   runHostTool,
   normalizeThinkingLevel,
   pruneSubagentIdMap,
@@ -437,7 +439,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // False once this hook instance unmounts: background loops (prompt/bash
   // settlement polling) must not keep firing on a dead instance.
   const hookAliveRef = useRef(true);
-  const pendingHostToolControllersRef = useRef(new Map<string, AbortController>());
+  const pendingHostToolControllersRef = useRef(new Map<string, { controller: AbortController; claimId?: string }>());
   const [modelNames, setModelNames] = useState<Record<string, string>>({});
   const [modelList, setModelList] = useState<ModelEntry[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
@@ -1697,7 +1699,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // The server rejected this chat's pending host tools when its subscription left (rejectPendingHostTools), and
         // the cancel it emitted had no listener: withdraw them here so nothing answers or opens a settled call.
         if (eventSourceRef.current === es) {
-          for (const controller of pendingHostToolControllersRef.current.values()) controller.abort();
+          for (const pending of pendingHostToolControllersRef.current.values()) pending.controller.abort();
         }
         if (es.readyState === EVENT_STREAM_CLOSED) {
           // Fatal error (409 unmanaged wrapper, worker failure): the stream
@@ -1866,13 +1868,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleHostToolCall = useCallback(async (id: string, toolName: string, args: Record<string, unknown>, openUrlAuthorization?: unknown) => {
     const sid = sessionIdRef.current;
     if (!sid || pendingHostToolControllersRef.current.has(id)) return;
-    const controller = new AbortController();
-    pendingHostToolControllersRef.current.set(id, controller);
+    const pending = { controller: new AbortController(), claimId: undefined as string | undefined };
+    const controller = pending.controller;
+    pendingHostToolControllersRef.current.set(id, pending);
     const openUrl = onOpenUrl ?? ((url: string, confirmationRequired: boolean) => {
       if (confirmationRequired) return false;
-      const opened = window.open(url, "_blank", "noopener,noreferrer");
-      opened?.focus?.();
-      return opened !== null;
+      return openUrlInIsolatedWindow(url);
     });
     try {
       const result = await runHostTool(toolName, args, {
@@ -1886,10 +1887,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }, sid, controller.signal, openUrlAuthorization);
       if (controller.signal.aborted) return;
       if (result.openUrl) {
-        if (result.authorizeOpenUrl) {
-          await sendAgentCommand(sid, { type: "authorize_open_url", id });
-          if (controller.signal.aborted) return;
-        }
+        if (!result.claimOpenUrl) throw new Error("Browser URL claim was not requested.");
+        pending.claimId = randomUUID();
+        const claim = await sendAgentCommand<{ token?: unknown }>(sid, {
+          type: "authorize_open_url", id, claimId: pending.claimId,
+        });
+        if (controller.signal.aborted || typeof claim?.token !== "string") return;
         let opened = false;
         try {
           opened = await openUrl(result.openUrl, false, controller.signal);
@@ -1897,7 +1900,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           opened = false;
         }
         if (!controller.signal.aborted) {
-          await respondHostTool(sid, id, opened ? `Opened ${result.openUrl}` : `The browser did not open ${result.openUrl}`, !opened);
+          await sendAgentCommand(sid, {
+            type: "host_tool_result",
+            id,
+            openUrlToken: claim.token,
+            isError: !opened,
+            result: { content: [{ type: "text", text: opened ? `Opened ${result.openUrl}` : `The browser did not open ${result.openUrl}` }] },
+          });
         }
       } else {
         await respondHostTool(sid, id, result.text, result.isError);
@@ -3071,7 +3080,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         break;
       }
       case "host_tool_cancel": {
-        if (typeof event.targetId === "string") pendingHostToolControllersRef.current.get(event.targetId)?.abort();
+        if (typeof event.targetId === "string") {
+          const pending = pendingHostToolControllersRef.current.get(event.targetId);
+          if (pending && (typeof event.claimId !== "string" || event.claimId !== pending.claimId)) pending.controller.abort();
+        }
         break;
       }
       case "host_uri_request": {
@@ -4865,7 +4877,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const pendingHostTools = pendingHostToolControllersRef.current;
     return () => {
       hookAliveRef.current = false;
-      for (const controller of pendingHostTools.values()) controller.abort();
+      for (const pending of pendingHostTools.values()) pending.controller.abort();
       clearTerminalReconcileTimer();
       bashRecoveryIdRef.current += 1;
       eventCoalescerRef.current?.reset();

@@ -1,4 +1,4 @@
-import { grant, has, revoke } from "./tool-approval-store";
+import { grant, has } from "./tool-approval-store";
 import { resolveToolPolicy, type CapabilityId, type OperationPolicy } from "./tool-access-policy";
 import { readWebServerSettingsFromDisk } from "./web-settings";
 import { readToolPolicyGeneration, withToolPolicyLock } from "./tool-policy-lock";
@@ -22,6 +22,10 @@ export interface AuthorizeToolCapabilityInput {
 
 export type DeferredToolAuthorizationInput = Omit<AuthorizeToolCapabilityInput, "confirm">;
 export type DeferredToolAuthorization = "authorized" | "confirmation_required";
+export interface DeferredToolAuthorizationResolution {
+  authorization: DeferredToolAuthorization;
+  generation: number;
+}
 
 const SCOPE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const RESERVED: Record<string, boolean> = { __proto__: true, prototype: true, constructor: true };
@@ -94,58 +98,72 @@ const deferredInput = (input: DeferredToolAuthorizationInput): AuthorizeToolCapa
   confirm: async () => false,
 });
 
-/** Resolve policy without asking. The caller must later finalize a confirmed request through confirmToolCapability. */
-export function resolveDeferredToolAuthorization(input: DeferredToolAuthorizationInput): DeferredToolAuthorization {
+/** Resolve policy without asking and bind the routed event to the current policy generation. */
+export function resolveDeferredToolAuthorization(input: DeferredToolAuthorizationInput): DeferredToolAuthorizationResolution {
   validateToolCaller(input.caller);
-  return withToolPolicyLock(() => {
+  return withToolPolicyLock((lock) => {
     if (input.signal?.aborted) throw new Error("The tool request was cancelled before authorization.");
     const authorization = deferredInput(input);
     const policy = resolved(authorization);
     if (policy.target?.enabled === false) throw new Error(`The target ${input.resourceKey ?? "resource"} denies ${input.capabilityLabel}.`);
     if (!policy.allowed) throw new Error(`${input.capabilityLabel} is disabled by tool policy.`);
-    if (policy.caller.confirmation === "allow" && policy.target?.confirmation !== "ask") return "authorized";
+    const generation = readToolPolicyGeneration(lock, input.capability);
+    if (policy.caller.confirmation === "allow" && policy.target?.confirmation !== "ask") {
+      return { authorization: "authorized", generation };
+    }
     const sessionId = currentSessionId(authorization);
-    return input.capability !== "omp.bash" && input.resourceType !== undefined && input.resourceKey !== undefined
+    const state = input.capability !== "omp.bash" && input.resourceType !== undefined && input.resourceKey !== undefined
       && has(sessionId, input.resourceType, input.resourceKey, input.capability)
       ? "authorized"
       : "confirmation_required";
+    return { authorization: state, generation };
   });
 }
 
-/** Finalize an externally confirmed deferred request while its server-owned pending identity still exists. */
-export function confirmToolCapability(
+/** Atomically claim one pending browser action without persisting remembered authority. */
+export function claimDeferredToolAuthorization(
   input: DeferredToolAuthorizationInput,
+  expectedGeneration: number,
+  userConfirmed: boolean,
   isPending: () => boolean,
-): { sessionId: string; granted: boolean } {
+): { sessionId: string; generation: number; rememberOnSuccess: boolean } {
   validateToolCaller(input.caller);
-  return withToolPolicyLock(() => {
+  return withToolPolicyLock((lock) => {
     if (!isPending()) throw new Error("The tool request is no longer pending.");
-    if (input.signal?.aborted) throw new Error("The tool request was cancelled before approval was granted.");
+    if (input.signal?.aborted) throw new Error("The tool request was cancelled before authorization.");
+    const generation = readToolPolicyGeneration(lock, input.capability);
+    if (generation !== expectedGeneration) throw new Error("The browser URL authorization changed before execution was claimed.");
     const authorization = deferredInput(input);
     const current = resolved(authorization);
     if (current.target?.enabled === false) throw new Error(`The target ${input.resourceKey ?? "resource"} denies ${input.capabilityLabel}.`);
     if (!current.allowed) throw new Error(`${input.capabilityLabel} is disabled by tool policy.`);
     const sessionId = currentSessionId(authorization);
+    const hasGrant = input.resourceType !== undefined && input.resourceKey !== undefined
+      && has(sessionId, input.resourceType, input.resourceKey, input.capability);
     const confirmationRequired = current.caller.confirmation === "ask" || current.target?.confirmation === "ask";
-    const remembers = confirmationRequired && input.capability !== "omp.bash"
-      && input.resourceType !== undefined && input.resourceKey !== undefined;
-    const granted = remembers && !has(sessionId, input.resourceType!, input.resourceKey!, input.capability);
-    if (granted) grant(sessionId, input.resourceType!, input.resourceKey!, input.capability);
-    return { sessionId, granted };
+    if (!userConfirmed && confirmationRequired && !hasGrant) {
+      throw new Error("The browser URL authorization changed before execution was claimed.");
+    }
+    return { sessionId, generation, rememberOnSuccess: userConfirmed && confirmationRequired && !hasGrant };
   });
 }
 
-/** Remove only the grant created by a confirmed request whose browser execution subsequently failed. */
-export function revokeConfirmedToolCapability(
+/** Persist a remembered grant only after the claimed browser action actually succeeds. */
+export function promoteClaimedToolApproval(
   input: DeferredToolAuthorizationInput,
-  grantedSessionId: string,
+  claimedSessionId: string,
+  expectedGeneration: number,
   isPending: () => boolean,
 ): void {
-  withToolPolicyLock(() => {
-    if (!isPending() || input.resourceType === undefined || input.resourceKey === undefined) return;
-    revoke(grantedSessionId, input.resourceType, input.resourceKey, input.capability);
-    const current = currentSessionId(deferredInput(input));
-    if (current !== grantedSessionId) revoke(current, input.resourceType, input.resourceKey, input.capability);
+  withToolPolicyLock((lock) => {
+    if (!isPending() || input.resourceType === undefined || input.resourceKey === undefined) {
+      throw new Error("The browser URL claim is no longer pending.");
+    }
+    if (readToolPolicyGeneration(lock, input.capability) !== expectedGeneration) return;
+    const current = resolved(deferredInput(input));
+    const confirmationRequired = current.allowed
+      && (current.caller.confirmation === "ask" || current.target?.confirmation === "ask");
+    if (confirmationRequired) grant(claimedSessionId, input.resourceType, input.resourceKey, input.capability);
   });
 }
 

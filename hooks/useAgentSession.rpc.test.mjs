@@ -3428,6 +3428,11 @@ test("viewed open_url calls honor server authorization and confirm through their
     return true;
   };
   const { es } = await startRun("s1", "q1", false, { onOpenUrl });
+  const authorize = (id, token) => world.holds.push({
+    match: (method, _url, body) => method === "POST" && body?.type === "authorize_open_url" && body.id === id,
+    produce: async () => ({ value: { success: true, data: { token } } }),
+  });
+  authorize("asked-url", "asked-token");
 
   await act(async () => {
     es.emit({
@@ -3439,9 +3444,10 @@ test("viewed open_url calls honor server authorization and confirm through their
     });
     await sleep(30);
   });
-  const authorize = callsTo("POST", "/api/agent/s1").find((call) => call.body?.type === "authorize_open_url" && call.body.id === "asked-url");
+  const askedClaim = callsTo("POST", "/api/agent/s1").find((call) => call.body?.type === "authorize_open_url" && call.body.id === "asked-url");
   const asked = callsTo("POST", "/api/agent/s1").find((call) => call.body?.type === "host_tool_result" && call.body.id === "asked-url");
-  assert.ok(authorize, "confirmation ACK uses the existing session-command transport without settling the host tool");
+  assert.ok(askedClaim, "both ask and allow paths claim the exact pending callback before opening");
+  assert.equal(asked?.body.openUrlToken, "asked-token");
   assert.equal(asked?.body.isError, false);
   assert.deepEqual(decisions.slice(0, 2), [
     ["https://ask.test/path", true],
@@ -3449,6 +3455,7 @@ test("viewed open_url calls honor server authorization and confirm through their
   ]);
   assert.deepEqual(opened, ["https://ask.test/path"], "the URL opens only after the confirmed result succeeds");
 
+  authorize("allowed-url", "allowed-token");
   await act(async () => {
     es.emit({
       type: "host_tool_call",
@@ -3459,11 +3466,14 @@ test("viewed open_url calls honor server authorization and confirm through their
     });
     await sleep(30);
   });
+  const allowedClaim = callsTo("POST", "/api/agent/s1").find((call) => call.body?.type === "authorize_open_url" && call.body.id === "allowed-url");
   const allowed = callsTo("POST", "/api/agent/s1").find((call) => call.body?.type === "host_tool_result" && call.body.id === "allowed-url");
-  assert.equal(callsTo("POST", "/api/agent/s1").some((call) => call.body?.type === "authorize_open_url" && call.body.id === "allowed-url"), false);
+  assert.ok(allowedClaim, "authorized events still require a single-use execution claim");
+  assert.equal(allowed?.body.openUrlToken, "allowed-token");
   assert.equal(allowed?.body.isError, false);
   assert.deepEqual(opened, ["https://ask.test/path", "https://allow.test/"]);
 
+  authorize("blocked-url", "blocked-token");
   await act(async () => {
     es.emit({
       type: "host_tool_call",
@@ -3476,6 +3486,7 @@ test("viewed open_url calls honor server authorization and confirm through their
   });
   assert.ok(callsTo("POST", "/api/agent/s1").some((call) => call.body?.type === "authorize_open_url" && call.body.id === "blocked-url"));
   const blocked = callsTo("POST", "/api/agent/s1").find((call) => call.body?.type === "host_tool_result" && call.body.id === "blocked-url");
+  assert.equal(blocked?.body.openUrlToken, "blocked-token");
   assert.equal(blocked?.body.isError, true, "opener failure is reported only after authorization");
   assert.match(blocked?.body.result.content[0].text ?? "", /did not open/);
 

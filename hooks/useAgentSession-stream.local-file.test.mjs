@@ -3,7 +3,50 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createServer } from "node:http";
 
-const { runHostTool, LOCAL_FILE_LOOKUP_TIMEOUT_MS } = await import("./useAgentSession-stream.ts");
+const { formatOpenUrlConfirmation, openUrlInIsolatedWindow, runHostTool, LOCAL_FILE_LOOKUP_TIMEOUT_MS } = await import("./useAgentSession-stream.ts");
+
+test("isolated URL opening reports blocked, successful, and failed navigation", (t) => {
+  const originalWindow = globalThis.window;
+  t.after(() => { globalThis.window = originalWindow; });
+
+  globalThis.window = { open: () => null };
+  assert.equal(openUrlInIsolatedWindow("https://blocked.test/"), false);
+
+  const meta = {};
+  const popup = {
+    opener: globalThis,
+    document: {
+      createElement: () => meta,
+      head: { append: (node) => { assert.equal(node, meta); } },
+    },
+    location: { replace: (url) => { popup.navigated = url; } },
+    focus: () => { popup.focused = true; },
+    close: () => { popup.closed = true; },
+  };
+  globalThis.window = { open: (url, target) => {
+    assert.deepEqual([url, target], ["about:blank", "_blank"]);
+    return popup;
+  } };
+  assert.equal(openUrlInIsolatedWindow("https://ok.test/path"), true);
+  assert.equal(popup.opener, null);
+  assert.deepEqual(meta, { name: "referrer", content: "no-referrer" });
+  assert.equal(popup.navigated, "https://ok.test/path");
+  assert.equal(popup.focused, true);
+
+  popup.location.replace = () => { throw new Error("navigation failed"); };
+  assert.equal(openUrlInIsolatedWindow("https://error.test/"), false);
+  assert.equal(popup.closed, true);
+});
+
+test("URL confirmation copy names capability, canonical origin, source session, and lifetime", () => {
+  for (const sessionId of ["viewed-session", "cross-session"]) {
+    const copy = formatOpenUrlConfirmation("https://example.test", sessionId);
+    assert.match(copy, /browser\.open_url/);
+    assert.match(copy, /https:\/\/example\.test/);
+    assert.match(copy, new RegExp(sessionId));
+    assert.match(copy, /session's lifetime/);
+  }
+});
 
 test("a local:// lookup the server never answers ends the open_file call with an error, not a hang", async (t) => {
   // Client deadlines are an AbortController and a timer: AbortSignal.timeout is missing in older browsers.

@@ -134,3 +134,22 @@ Task 4B verification:
 - `bun test --timeout 30000 lib/event-stream-protocol.test.mjs lib/browser-link.test.mjs lib/agent-client.test.mjs` — 53 pass, 0 fail.
 - `npm run typecheck` — pass.
 - Scoped ESLint over changed implementation/tests — 0 errors; 5 pre-existing `react-hooks/exhaustive-deps` warnings in `components/AppShell.tsx`.
+
+## Task 4B fix round 1: single-owner execution claim
+
+- Canonicalized browser URLs once on the server and routed the resulting `url.href`; the remembered resource origin comes from that same parsed URL.
+- Replaced provisional grants with a single-use, in-memory execution claim for both ask and authorized paths. `authorize_open_url` atomically checks the exact pending ID, policy generation, caller and current legal session, then returns a short-lived opaque token without settling native or persisting authority.
+- Claiming broadcasts a claim-ID-qualified withdrawal so competing viewed/cross-session dialogs close while the winner continues. Only one matching token can complete the original `host_tool_result`; unknown, stale, duplicate, mismatched, expired and post-restart tokens never reach native.
+- The browser opens only after claim ACK through a controlled same-origin blank window, severs `opener`, installs `no-referrer`, and then navigates. Popup blocking and navigation errors are observable and return an error result.
+- Successful actual opener results promote remembered authority only while the claimed policy generation remains current. Opener failures, cancellations and restarts create no grant; policy narrowing after ACK does not undo the already-claimed action and also cannot create stale remembered authority.
+- Confirmation copy names `browser.open_url`, canonical origin, source session and session-lifetime remembrance in viewed and cross-session flows. `open_file` and the no-new-route boundary remain unchanged.
+
+Fix-round verification:
+
+- RED canonicalization: focused RPC test received `https:example.com/path` instead of `https://example.com/path`.
+- RED popup: focused helper test failed because `openUrlInIsolatedWindow` did not exist.
+- `bun test --timeout 30000 lib/rpc-manager.test.mjs` — 161 pass, 0 fail.
+- `bun test --timeout 30000 hooks/useAgentSession.rpc.test.mjs hooks/useAgentSession-stream.local-file.test.mjs` — 333 pass, 0 fail.
+- `bun test --timeout 30000 lib/tool-policy-runtime.test.mjs lib/tool-approval-store.test.mjs lib/event-stream-protocol.test.mjs lib/browser-link.test.mjs lib/agent-client.test.mjs` — 70 pass, 0 fail.
+- `npm run typecheck` — pass.
+- Scoped ESLint — 0 errors; 5 pre-existing `react-hooks/exhaustive-deps` warnings in `components/AppShell.tsx`.

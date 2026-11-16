@@ -539,6 +539,7 @@ export type CrossSessionHostToolEvent = (CrossSessionHostToolCall & { type?: "ho
   type: "host_tool_cancel";
   sessionId: string;
   targetId: string;
+  claimId?: string;
 };
 
 export interface ExitedRpcSession {
