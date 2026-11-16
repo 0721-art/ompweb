@@ -30,9 +30,9 @@ export interface ToolPolicies {
 
 export const EMPTY_TOOL_POLICIES: ToolPolicies = {
   version: 1,
-  global: {},
-  modelRoles: {},
-  agents: {},
+  global: Object.create(null),
+  modelRoles: Object.create(null),
+  agents: Object.create(null),
 };
 
 export interface ResolveToolPolicyInput {

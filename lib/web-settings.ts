@@ -16,8 +16,6 @@ import {
 export interface WebServerSettings {
   /** Resume sessions that were mid-run when omp-web stopped. */
   autoResumeSessions: boolean;
-  /** Transitional type-only field for callers migrated in Task 4; absent at runtime and never persisted. */
-  agentToolsEnabled: boolean;
   /** Versioned capability and confirmation policies owned by omp-web. */
   toolPolicies: ToolPolicies;
   /**
@@ -48,24 +46,24 @@ const DEFAULT_TOOL_POLICIES: ToolPolicies = {
     "github.actions.cancel": ASK,
     "github.actions.rerun": ASK,
   },
-  modelRoles: {},
-  agents: {},
+  modelRoles: Object.create(null),
+  agents: Object.create(null),
 };
 
 const CLOSED_TOOL_POLICIES: ToolPolicies = {
   version: 1,
   global: Object.fromEntries(CAPABILITY_IDS.map((capability) => [capability, DENY])),
-  modelRoles: {},
-  agents: {},
+  modelRoles: Object.create(null),
+  agents: Object.create(null),
 };
 
-const DEFAULTS = {
+const DEFAULTS: WebServerSettings = {
   autoResumeSessions: false,
   toolPolicies: DEFAULT_TOOL_POLICIES,
   agentEnv: {},
   browserTransport: "ws",
   uploadRetentionDays: DEFAULT_UPLOAD_RETENTION_DAYS,
-} as WebServerSettings;
+};
 
 /** What every hello and `transport` frame tells the browser. */
 export function browserTransportState(settings = loadWebServerSettings()): BrowserTransportState {
@@ -93,7 +91,7 @@ function operationPolicy(value: unknown, allowInherit = false): OperationPolicy 
 
 function capabilityMap(value: unknown, allowInherit = false): Partial<Record<CapabilityId, OperationPolicy | "inherit">> {
   if (!isRecord(value)) throw new Error("Tool capability policies must be an object.");
-  const result: Partial<Record<CapabilityId, OperationPolicy | "inherit">> = {};
+  const result: Partial<Record<CapabilityId, OperationPolicy | "inherit">> = Object.create(null);
   for (const [capability, policy] of Object.entries(value)) {
     if (!CAPABILITY_IDS.includes(capability as CapabilityId)) throw new Error(`Unknown tool capability: ${capability}.`);
     result[capability as CapabilityId] = operationPolicy(policy, allowInherit);
@@ -101,12 +99,17 @@ function capabilityMap(value: unknown, allowInherit = false): Partial<Record<Cap
   return result;
 }
 
+const RESERVED_SCOPE_IDS = ["__proto__", "prototype", "constructor"];
+const SCOPE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
 function scopedPolicies(value: unknown, allowInherit = false): Record<string, Partial<Record<CapabilityId, OperationPolicy | "inherit">>> {
   if (!isRecord(value)) throw new Error("Scoped tool policies must be an object.");
-  return Object.fromEntries(Object.entries(value).map(([id, policies]) => {
-    if (!id) throw new Error("Tool policy scope IDs must not be empty.");
-    return [id, capabilityMap(policies, allowInherit)];
-  }));
+  const result: Record<string, Partial<Record<CapabilityId, OperationPolicy | "inherit">>> = Object.create(null);
+  for (const [id, policies] of Object.entries(value)) {
+    if (RESERVED_SCOPE_IDS.includes(id) || !SCOPE_ID.test(id)) throw new Error("Tool policy scope IDs must be 1-128 letters, numbers, dots, underscores, or hyphens.");
+    result[id] = capabilityMap(policies, allowInherit);
+  }
+  return result;
 }
 
 export function parseToolPolicies(value: unknown): ToolPolicies {
@@ -121,25 +124,38 @@ export function parseToolPolicies(value: unknown): ToolPolicies {
   };
 }
 
-function legacyActionPolicy(value: unknown): OperationPolicy {
-  return value === "deny" ? DENY : value === "allow" ? ALLOW : ASK;
+function legacyActionsPolicies(value: unknown): Pick<ToolPolicies["global"], "github.actions.dispatch" | "github.actions.cancel" | "github.actions.rerun"> {
+  const operations = ["dispatch", "cancel", "rerun"] as const;
+  const actions = isRecord(value) ? value : null;
+  const invalid = value !== undefined && (
+    !actions
+    || Object.keys(actions).some((operation) => !operations.includes(operation as (typeof operations)[number]))
+    || operations.some((operation) => actions[operation] !== undefined && !["deny", "ask", "allow"].includes(actions[operation] as string))
+  );
+  const policy = (operation: (typeof operations)[number]): OperationPolicy => {
+    if (invalid || actions?.[operation] === "deny") return DENY;
+    if (actions?.[operation] === "allow") return ALLOW;
+    return ASK;
+  };
+  return {
+    "github.actions.dispatch": policy("dispatch"),
+    "github.actions.cancel": policy("cancel"),
+    "github.actions.rerun": policy("rerun"),
+  };
 }
 
 function migrateToolPolicies(raw: Record<string, unknown>): ToolPolicies {
   if (raw.toolPolicies !== undefined) return parseToolPolicies(raw.toolPolicies);
-  const actions = isRecord(raw.githubActionsPermissions) ? raw.githubActionsPermissions : {};
   return {
     version: 1,
     global: {
       ...DEFAULT_TOOL_POLICIES.global,
       "ompweb.agent_tools": raw.agentToolsEnabled === true ? ALLOW : DENY,
       "github.discussions": raw.githubWritesUnasked === true ? ALLOW : ASK,
-      "github.actions.dispatch": legacyActionPolicy(actions.dispatch),
-      "github.actions.cancel": legacyActionPolicy(actions.cancel),
-      "github.actions.rerun": legacyActionPolicy(actions.rerun),
+      ...legacyActionsPolicies(raw.githubActionsPermissions),
     },
-    modelRoles: {},
-    agents: {},
+    modelRoles: Object.create(null),
+    agents: Object.create(null),
   };
 }
 
@@ -158,7 +174,7 @@ function normalizeSettings(raw: Record<string, unknown>): WebServerSettings {
     agentEnv: readAgentEnvRecord(raw.agentEnv),
     browserTransport: BROWSER_TRANSPORTS.find((transport) => transport === raw.browserTransport) ?? "ws",
     uploadRetentionDays: isUploadRetentionDays(raw.uploadRetentionDays) ? raw.uploadRetentionDays : DEFAULT_UPLOAD_RETENTION_DAYS,
-  } as WebServerSettings;
+  };
 }
 
 function parseSettingsRecord(text: string): Record<string, unknown> {
@@ -260,14 +276,15 @@ export interface ToolPoliciesPatch {
   agents?: Record<string, ToolPolicyPatchMap>;
 }
 
-type WebServerSettingsPatch = Omit<Partial<WebServerSettings>, "toolPolicies"> & {
+type WebServerSettingsPatch = Partial<Pick<WebServerSettings, "autoResumeSessions" | "agentEnv" | "browserTransport" | "uploadRetentionDays">> & {
   toolPolicies?: ToolPoliciesPatch;
 };
 
 function mergeScopedPolicies(current: ToolPolicies["modelRoles"], patch: Record<string, ToolPolicyPatchMap> | undefined): ToolPolicies["modelRoles"] {
-  const merged = structuredClone(current);
+  const merged: ToolPolicies["modelRoles"] = Object.create(null);
+  for (const [id, policies] of Object.entries(current)) merged[id] = Object.assign(Object.create(null), policies);
   for (const [id, changes] of Object.entries(patch ?? {})) {
-    const scope = { ...(merged[id] ?? {}) };
+    const scope = merged[id] ?? Object.create(null);
     for (const [capability, policy] of Object.entries(changes) as Array<[CapabilityId, OperationPolicy | "inherit"]>) {
       if (policy === "inherit") delete scope[capability];
       else scope[capability] = policy;
@@ -289,6 +306,10 @@ function mergeToolPolicies(current: ToolPolicies, patch: ToolPoliciesPatch | und
 }
 /** Atomic write (temp file + rename), like the project registry. Private to its user: it holds agentEnv. */
 export function saveWebServerSettings(patch: WebServerSettingsPatch): WebServerSettings {
+  for (const legacy of ["agentToolsEnabled", "githubWritesUnasked", "githubActionsPermissions"]) {
+    if (Object.hasOwn(patch, legacy)) throw new Error(`${legacy} has moved to toolPolicies.`);
+  }
+  const toolPoliciesPatch = patch.toolPolicies === undefined ? undefined : parseToolPoliciesPatch(patch.toolPolicies);
   const path = settingsPath();
   mkdirSync(resolve(path, ".."), { recursive: true });
   const lockPath = settingsLockPath();
@@ -300,10 +321,12 @@ export function saveWebServerSettings(patch: WebServerSettingsPatch): WebServerS
     lock.exec("PRAGMA busy_timeout = 5000");
     lock.exec("BEGIN IMMEDIATE");
     const current = readWebServerSettingsFromDisk();
-    const settings = {
-      ...current,
-      ...patch,
-      toolPolicies: mergeToolPolicies(current.toolPolicies, patch.toolPolicies),
+    const settings: WebServerSettings = {
+      autoResumeSessions: patch.autoResumeSessions ?? current.autoResumeSessions,
+      toolPolicies: mergeToolPolicies(current.toolPolicies, toolPoliciesPatch),
+      agentEnv: patch.agentEnv ?? current.agentEnv,
+      browserTransport: patch.browserTransport ?? current.browserTransport,
+      uploadRetentionDays: patch.uploadRetentionDays === undefined ? current.uploadRetentionDays : patch.uploadRetentionDays,
     };
     writeFileSync(temp, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     renameSync(temp, path);
