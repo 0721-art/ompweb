@@ -40,6 +40,33 @@ const MODES: Record<OutboxMode, true> = { prompt: true, followUp: true, steer: t
 
 const COLUMNS = "id, session_id, mode, message, images, uploads, owner, advisor, state, error, may_have_been_sent, created_at, upload_receipts, previous_entry_ids, source_session_id, settlement, replacement_id, replacement_digest, payload_bytes";
 const RECEIPT_PIN_SCHEMA = "CREATE TABLE IF NOT EXISTS github_receipt_pins (session_id TEXT NOT NULL, entry_id TEXT NOT NULL, PRIMARY KEY (entry_id, session_id))";
+const WATCH_OWNER_PREFIX = `${GITHUB_WATCH_OUTBOX_OWNER}:`;
+
+function persistedWatchOwner(authorization: { caller?: ToolCaller; repository: string }): string {
+  return `${WATCH_OWNER_PREFIX}${Buffer.from(JSON.stringify(authorization)).toString("base64url")}`;
+}
+
+function watchAuthorization(owner: string): { caller?: ToolCaller; repository: string } | null {
+  if (!owner.startsWith(WATCH_OWNER_PREFIX)) return null;
+  try {
+    const value: unknown = JSON.parse(Buffer.from(owner.slice(WATCH_OWNER_PREFIX.length), "base64url").toString());
+    if (!isRecord(value) || typeof value.repository !== "string" || !value.repository) return null;
+    const caller = isRecord(value.caller) ? {
+      ...(typeof value.caller.agentId === "string" ? { agentId: value.caller.agentId } : {}),
+      ...(typeof value.caller.modelRole === "string" ? { modelRole: value.caller.modelRole } : {}),
+    } : undefined;
+    return { repository: value.repository, ...(caller && Object.keys(caller).length ? { caller } : {}) };
+  } catch {
+    return null;
+  }
+}
+
+function watchEntryAuthorized(entry: Row): boolean {
+  const authorization = watchAuthorization(entry.owner);
+  return authorization !== null && hasToolCapabilityAuthorization(
+    "github.read_watch", entry.session_id, "github.repository", authorization.repository, authorization.caller,
+  );
+}
 
 /** `owner`: the web session whose uploads the entry attaches; `advisor`: the chat's spawn flag at Send. */
 interface Row {
@@ -577,7 +604,7 @@ export async function runOutboxCommand(
       const matchesOriginal = replaceable !== null
         && createHmac("sha256", digestKey).update(JSON.stringify([replaceable.mode, replaceable.message, replaceable.images, replaceable.uploads])).digest("base64url") === retryDigest;
       let uploadReceipts: OutboxUploadReceipt[];
-      let entryOwner = owner;
+      let entryOwner = owner === GITHUB_WATCH_OUTBOX_OWNER && authorization ? persistedWatchOwner(authorization) : owner;
       if (replaceable && matchesOriginal && uploadIds.length > 0 && owner !== replaceable.owner && command.uploadProofs === undefined) {
         const receipts = replaceable.upload_receipts ? JSON.parse(replaceable.upload_receipts) as OutboxUploadReceipt[] : [];
         const checkedAt = Date.now();
@@ -922,6 +949,12 @@ function onChildExit(wrapper: AgentSessionWrapper, event: AgentEvent): void {
 type Outcome = "next" | "wait" | "offline";
 
 async function deliver(entry: Row): Promise<Outcome> {
+  if (entry.owner.startsWith(WATCH_OWNER_PREFIX) && !watchEntryAuthorized(entry)) {
+    retire(entry.id, "none");
+    releaseOutboxReceipt(entry.id);
+    publish(entry.session_id);
+    return "next";
+  }
   const sessionId = entry.session_id;
   if (entry.uploads && Date.now() - entry.created_at > STAGED_MAX_AGE_MS) {
     // The host's sweep has removed the staged files by now (spec O3): never send the message without them.
@@ -932,6 +965,12 @@ async function deliver(entry: Row): Promise<Outcome> {
   const generation = priorWrapper?.getMessageCommandGeneration() ?? 0;
   const competingPending = priorWrapper?.hasPendingMessageCommands() ?? false;
   const started = await runAgentCommand(sessionId, { type: "get_state" }, entry.advisor === 1, entry.owner);
+  if (entry.owner.startsWith(WATCH_OWNER_PREFIX) && !watchEntryAuthorized(entry)) {
+    retire(entry.id, "none");
+    releaseOutboxReceipt(entry.id);
+    publish(entry.session_id);
+    return "next";
+  }
   const wrapper = getRpcSession(sessionId);
   const current = row(entry.id);
   if (!current || (current.state !== "held" && current.state !== "waiting_host")) return "next";
@@ -1015,6 +1054,12 @@ async function deliver(entry: Row): Promise<Outcome> {
       }
     }
     if (!wrapper.isAlive()) return retry(current);
+    if (current.owner.startsWith(WATCH_OWNER_PREFIX) && !watchEntryAuthorized(current)) {
+      retire(current.id, "none");
+      releaseOutboxReceipt(current.id);
+      publish(current.session_id);
+      return "next";
+    }
     if (row(current.id)?.state !== "delivering") return "next";
     if (wrapper.getMessageCommandGeneration() !== (priorWrapper === wrapper ? generation : 0)
       || (competingPending && !wrapper.hasPendingMessageCommands())) {

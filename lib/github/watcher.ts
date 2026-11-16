@@ -81,13 +81,14 @@ declare global {
 
 async function defaultDeliver(sessionId: string, id: string, message: string, watch?: Watch): Promise<Delivery> {
   try {
-    if (!watch) return "retry";
     // Lazy: message-outbox pulls in rpc-manager, which will load the agent tools that load this module.
     const { runOutboxCommand, outboxScope, GITHUB_WATCH_OUTBOX_OWNER } = await import("../message-outbox");
+    const command = { type: "outbox_add", id, scope: outboxScope(), mode: "prompt", message };
+    if (!watch) return await deliveryOf(await runOutboxCommand(sessionId, command, false, "omp-web:github-watch-notice"));
     const target = parseGithubTarget(watch.itemKey);
     return await deliveryOf(await runOutboxCommand(
       sessionId,
-      { type: "outbox_add", id, scope: outboxScope(), mode: "prompt", message },
+      command,
       false,
       GITHUB_WATCH_OUTBOX_OWNER,
       { caller: watch.caller, repository: repoKeyOf(target) },

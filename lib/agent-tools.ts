@@ -120,6 +120,7 @@ export interface AgentToolDeliverInput {
   delivery: "prompt" | "steer" | "followUp";
   wait: boolean;
   waitTimeoutMs: number;
+  authorize(): Promise<void>;
 }
 
 export interface AgentToolDeliverResult {
@@ -419,7 +420,7 @@ export async function executeAgentTool(
   if (!targetHostId) throw new Error(`Session not found: ${sessionId}`);
   const target = ops.listHosts().find((host) => host.id === targetHostId);
   if (!target) throw new Error(`Unknown target host: ${targetHostId}`);
-  await authorizeToolCapability({
+  const authorize = () => authorizeToolCapability({
     capability: "ompweb.session_start",
     sessionId: () => ctx.sourceSessionId,
     resourceType: "host",
@@ -436,6 +437,7 @@ export async function executeAgentTool(
     },
     signal: ctx.signal,
   });
+  await authorize();
   if (ctx.signal?.aborted) throw new Error("The tool call was cancelled before sending.");
   const result = await ops.deliver({
     sessionId,
@@ -443,6 +445,7 @@ export async function executeAgentTool(
     delivery,
     wait,
     waitTimeoutMs,
+    authorize,
   });
   ctx.guard.setDepth(sessionId, depth);
   return result;

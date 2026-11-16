@@ -3441,12 +3441,19 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
         if (!current?.agentStartPolicy.enabled) throw new Error(`Target host ${host.id} no longer allows agent starts.`);
         return true;
       };
-      const initialize = async (session: AgentSessionWrapper, preserveUnknownDelivery: boolean) => {
+      const initialize = async (session: AgentSessionWrapper, preserveUnknownDelivery: boolean, reauthorize: () => Promise<unknown>) => {
         if (input.provider && input.modelId) {
+          await reauthorize();
           await session.send({ type: "set_model", provider: input.provider, modelId: input.modelId }, { preserveUnknownDelivery });
         }
-        if (input.name) await session.send({ type: "set_session_name", name: input.name }, { preserveUnknownDelivery });
-        if (input.prompt) await session.send({ type: "prompt", message: input.prompt }, { preserveUnknownDelivery });
+        if (input.name) {
+          await reauthorize();
+          await session.send({ type: "set_session_name", name: input.name }, { preserveUnknownDelivery });
+        }
+        if (input.prompt) {
+          await reauthorize();
+          await session.send({ type: "prompt", message: input.prompt }, { preserveUnknownDelivery });
+        }
       };
       if (!input.shareWorkspace && !input.explicitHost && input.hostId === source.sourceHostId) {
         const sessions = await listSessionsAllHosts();
@@ -3458,11 +3465,11 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
           const creationId = createHash("sha256").update("ompweb:agent-creation:v1:")
             .update(JSON.stringify([source.sourceSessionId, source.sourceRequestId])).digest("hex");
           const result = await startPooledSession({ creationId, poolId: binding.pool.id, projectId: binding.project.id, intent: { ...input } }, async (host, prepared, id, onStarted) => {
-            const started = await startNewRpcSession(host, prepared.cwd, undefined, false, true, id);
+            const started = await startNewRpcSession(host, prepared.cwd, undefined, false, true, id, () => authorizeHost(host));
             if (!started.ok) throw new HostOpError(started.status, started.code, started.error);
             const { session, realSessionId } = started.value;
             await onStarted(realSessionId);
-            await session.withPendingCommand(() => initialize(session, true), true);
+            await session.withPendingCommand(() => initialize(session, true, () => authorizeHost(host)), true);
             return { sessionId: realSessionId };
           }, authorizeHost);
           return { sessionId: result.sessionId };
@@ -3474,11 +3481,11 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
       if (!host) throw new Error(`Unknown host: ${input.hostId}`);
       if (!(await authorizeHost(host))) throw new Error(`The user declined to start a session on ${host.label}.`);
       const preparing = !!(input.prompt || input.name || (input.provider && input.modelId));
-      const started = await startNewRpcSession(host, input.cwd, undefined, undefined, preparing);
+      const started = await startNewRpcSession(host, input.cwd, undefined, undefined, preparing, undefined, () => authorizeHost(host));
       if (!started.ok) throw new Error(started.error);
       const { session, realSessionId } = started.value;
       try {
-        const run = () => initialize(session, false);
+        const run = () => initialize(session, false, () => authorizeHost(host));
         if (preparing) await session.withPendingCommand(run, true);
         else await run();
       } catch (error) {
@@ -3498,6 +3505,7 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
         const target = host && await sessionSpawnTarget(input.sessionId, host);
         if (!host || !target) throw new Error(`Session not found: ${input.sessionId}`);
         // The open's preparation lease keeps an idle shared child (and its advisor mode) until the message is sent.
+        await input.authorize();
         const started = await startRpcSession(input.sessionId, target.sessionFile, target.cwd, undefined, undefined, target.recordedCwd, undefined, host, true);
         wrapper = started.session;
         cold = true;
@@ -3506,6 +3514,7 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
       // A steer would interrupt the target's open ask: it goes as a follow-up, which the result reports.
       let delivery = input.delivery;
       const send = async () => {
+        await input.authorize();
         const wasRunning = target.isRunning();
         if (input.delivery === "prompt" && wasRunning) {
           throw new Error("Target session is running; use delivery \"steer\" or \"followUp\" for a running target.");
@@ -3572,6 +3581,7 @@ export async function startNewRpcSession(
   advisor?: boolean,
   preparingCommand = false,
   creationId?: string,
+  authorize?: () => Promise<unknown>,
 ): Promise<OpResult<{ session: AgentSessionWrapper; realSessionId: string }>> {
   if (creationId !== undefined && !CREATION_ID_RE.test(creationId)) {
     return { ok: false, status: 400, code: "invalid_creation_id", error: "Invalid creation identity" };
@@ -3583,11 +3593,13 @@ export async function startNewRpcSession(
       if (value.session.host.id !== host.id || value.session.cwd !== cwd) {
         return { ok: false, status: 409, code: "creation_conflict", error: "Creation identity belongs to a different host or worktree" };
       }
+      await authorize?.();
       return { ok: true, value };
     }
   }
   const validated = await host.sessionOps.validateCwd(cwd);
   if (!validated.ok) return validated;
+  await authorize?.();
   const spawnCwd = validated.value.cwd;
   if (creationId !== undefined && spawnCwd !== cwd) {
     return { ok: false, status: 409, code: "prepared_cwd_changed", error: "The prepared worktree is no longer available" };

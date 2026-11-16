@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { getAgentDir } from "../omp/paths";
 import { revokeToolApprovalResource } from "../tool-approval-revoke";
 import type { OperationPolicy } from "../tool-access-policy";
+import { withToolPolicyLock } from "../tool-policy-lock";
 
 export interface HostRecord {
   id: string;
@@ -147,23 +148,24 @@ export class ReservedHostError extends Error {
 }
 
 export function updateHost(id: string, updates: { label?: string; agentStartPolicy?: OperationPolicy; shareCredentials?: boolean }): HostRecord {
-  if (id === LOCAL_HOST_ID && (updates.agentStartPolicy !== undefined || updates.shareCredentials !== undefined)) throw new ReservedHostError();
-  const hosts = readHosts();
-  const host = hosts.find((h) => h.id === id);
-  if (!host) throw new UnknownHostError();
-  // An empty name resets this machine to the default.
-  if (updates.label !== undefined) host.label = id === LOCAL_HOST_ID && !updates.label.trim() ? "" : normalizeLabel(updates.label);
-  if (updates.agentStartPolicy !== undefined) {
-    const policy = operationPolicy(updates.agentStartPolicy);
-    if (!policy) throw new Error("Invalid agent-start policy");
-    if (!policy.enabled || (host.agentStartPolicy.confirmation === "allow" && policy.confirmation === "ask")) {
-      revokeToolApprovalResource("host", id, "ompweb.session_start");
+  return withToolPolicyLock(() => {
+    if (id === LOCAL_HOST_ID && (updates.agentStartPolicy !== undefined || updates.shareCredentials !== undefined)) throw new ReservedHostError();
+    const hosts = readHosts();
+    const host = hosts.find((h) => h.id === id);
+    if (!host) throw new UnknownHostError();
+    if (updates.label !== undefined) host.label = id === LOCAL_HOST_ID && !updates.label.trim() ? "" : normalizeLabel(updates.label);
+    if (updates.agentStartPolicy !== undefined) {
+      const policy = operationPolicy(updates.agentStartPolicy);
+      if (!policy) throw new Error("Invalid agent-start policy");
+      if (!policy.enabled || (host.agentStartPolicy.confirmation === "allow" && policy.confirmation === "ask")) {
+        revokeToolApprovalResource("host", id, "ompweb.session_start");
+      }
+      host.agentStartPolicy = policy;
     }
-    host.agentStartPolicy = policy;
-  }
-  if (updates.shareCredentials !== undefined) host.shareCredentials = updates.shareCredentials;
-  saveHosts(hosts);
-  return host;
+    if (updates.shareCredentials !== undefined) host.shareCredentials = updates.shareCredentials;
+    saveHosts(hosts);
+    return host;
+  });
 }
 
 /** Create the `local` record, or give the existing one a new token; the old token stops matching. */
