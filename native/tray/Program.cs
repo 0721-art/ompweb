@@ -256,7 +256,8 @@ class TrayApplication : IDisposable
         var psi = new ProcessStartInfo
         {
             FileName = _nodeExe,
-            WorkingDirectory = _repoRoot,
+            // Never from inside the installation: a cwd there blocks the next replacement on Windows.
+            WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,

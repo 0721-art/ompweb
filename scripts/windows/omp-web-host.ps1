@@ -15,6 +15,11 @@ param(
 $RepoRoot = (Resolve-Path "$PSScriptRoot\..\..").Path
 $LauncherJs = Join-Path $RepoRoot "bin\omp-web.js"
 
+# The updater replaces this installation in place, and Windows refuses to rename a
+# directory that is a live process's working directory (ERROR_SHARING_VIOLATION).
+# Every path below is absolute, so the children start outside the installation.
+$LaunchWorkingDirectory = $env:USERPROFILE
+
 # One daemon supervisor per logon session.
 $createdNew = $false
 try { $script:AppMutex = New-Object System.Threading.Mutex($true, "Local\OmpWebHostDaemon_Instance_Mutex", [ref]$createdNew) } catch { $createdNew = $true }
@@ -47,7 +52,7 @@ try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $env:ComSpec
         $psi.Arguments = "/d /s /c `"`"$NodeExe`" `"$LauncherJs`" host >> `"$LogFile`" 2>&1`""
-        $psi.WorkingDirectory = $RepoRoot
+        $psi.WorkingDirectory = $LaunchWorkingDirectory
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
         $proc = [System.Diagnostics.Process]::Start($psi)

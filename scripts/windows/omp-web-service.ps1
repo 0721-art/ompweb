@@ -13,6 +13,11 @@ param(
 
 $RepoRoot = (Resolve-Path "$PSScriptRoot\..\..").Path
 $PkgJsonPath = Join-Path $RepoRoot "package.json"
+
+# The updater replaces this installation in place, and Windows refuses to rename a
+# directory that is a live process's working directory (ERROR_SHARING_VIOLATION).
+# Every path below is absolute, so the server starts outside the installation.
+$LaunchWorkingDirectory = $env:USERPROFILE
 $PkgVersion = "0.0.0"
 if (Test-Path $PkgJsonPath) {
     try { $pkg = Get-Content $PkgJsonPath -Raw | ConvertFrom-Json; if ($pkg.version) { $PkgVersion = $pkg.version } } catch { }
@@ -119,7 +124,7 @@ function Start-WebServer {
     }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $NodeExe
-    $psi.WorkingDirectory = $RepoRoot
+    $psi.WorkingDirectory = $LaunchWorkingDirectory
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $false

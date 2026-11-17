@@ -38,6 +38,11 @@ Add-Type -AssemblyName System.Drawing
 # -----------------------------------------------------------------------------
 $RepoRoot = (Resolve-Path "$PSScriptRoot\..\..").Path
 $PkgJsonPath = Join-Path $RepoRoot "package.json"
+
+# The updater replaces this installation in place, and Windows refuses to rename a
+# directory that is a live process's working directory (ERROR_SHARING_VIOLATION).
+# Every path below is absolute, so the server and the shortcuts start outside it.
+$LaunchWorkingDirectory = $env:USERPROFILE
 $PkgVersion = "0.0.0"
 if (Test-Path $PkgJsonPath) {
     try {
@@ -236,7 +241,7 @@ function Start-WebServer {
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $NodeExe
-    $psi.WorkingDirectory = $RepoRoot
+    $psi.WorkingDirectory = $LaunchWorkingDirectory
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $false
@@ -363,7 +368,7 @@ function Set-AutostartShortcut([bool]$enable) {
             $shortcut = $wsh.CreateShortcut($startupLnk)
             $shortcut.TargetPath = $wscriptExe
             $shortcut.Arguments = "`"$launchVbs`" -Startup"
-            $shortcut.WorkingDirectory = $RepoRoot
+            $shortcut.WorkingDirectory = $LaunchWorkingDirectory
             if (Test-Path $IcoPath) {
                 $shortcut.IconLocation = "$IcoPath,0"
             }
