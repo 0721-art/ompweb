@@ -272,10 +272,16 @@ class TrayApplication : IDisposable
         else
         {
             var bunLauncher = Path.Combine(_repoRoot, "bin", "bun-runtime.js");
-            psi.Arguments = $"\"{bunLauncher}\" --hot server/dev.ts -H {_effectiveHostname} -p {_effectivePort}";
+            // The working directory is outside the installation, so both the dev entry and the config
+            // (Bun reads bunfig.toml from the working directory) are passed as absolute paths.
+            var bunfig = Path.Combine(_repoRoot, "bunfig.toml");
+            var devEntry = Path.Combine(_repoRoot, "server", "dev.ts");
+            psi.Arguments = $"\"{bunLauncher}\" \"--config={bunfig}\" --hot \"{devEntry}\" -H {_effectiveHostname} -p {_effectivePort}";
         }
 
         psi.EnvironmentVariables["OMP_WEB_PORT"] = _effectivePort.ToString();
+        // The child runs outside the installation, so name it explicitly (dev mode derives its root from this).
+        psi.EnvironmentVariables["OMP_WEB_PACKAGE_DIR"] = _repoRoot;
         psi.EnvironmentVariables["OMP_WEB_HOSTNAME"] = _effectiveHostname;
         psi.EnvironmentVariables["OMP_WEB_SERVICE"] = "1";
         psi.EnvironmentVariables["PORT"] = _effectivePort.ToString();
