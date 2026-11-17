@@ -253,11 +253,22 @@ class TrayApplication : IDisposable
 
         if (_nodeExe == null) _nodeExe = FindNodeExecutable();
 
+        // Never from inside the installation: a cwd there blocks the next replacement on Windows.
+        var workingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (string.IsNullOrWhiteSpace(workingDirectory))
+        {
+            // An empty value starts the child in the target's directory (or in this process's
+            // current one), and both of those are the installation.
+            WriteLog("USERPROFILE is empty: refusing to start the web server inside the installation.");
+            _state = "Stopped";
+            UpdateTrayUI();
+            return;
+        }
+
         var psi = new ProcessStartInfo
         {
             FileName = _nodeExe,
-            // Never from inside the installation: a cwd there blocks the next replacement on Windows.
-            WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            WorkingDirectory = workingDirectory,
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,

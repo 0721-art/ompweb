@@ -34,6 +34,11 @@ $LaunchVbs = Join-Path $RepoRoot "scripts\windows\launch-tray.vbs"
 # directory that is a live process's working directory (ERROR_SHARING_VIOLATION).
 # The shortcuts launch absolute targets, so they start outside the installation.
 $ShortcutWorkingDirectory = $env:USERPROFILE
+# A shortcut with an empty working directory starts in its target's directory, which is the
+# installation; refuse instead of silently reintroducing the lock.
+if ([string]::IsNullOrWhiteSpace($ShortcutWorkingDirectory)) {
+    throw "USERPROFILE is empty: refusing to create omp-web shortcuts that start inside the installation."
+}
 
 function Log-Message([string]$msg) {
     if (!$Quiet) {

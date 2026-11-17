@@ -18,6 +18,11 @@ $PkgJsonPath = Join-Path $RepoRoot "package.json"
 # directory that is a live process's working directory (ERROR_SHARING_VIOLATION).
 # Every path below is absolute, so the server starts outside the installation.
 $LaunchWorkingDirectory = $env:USERPROFILE
+# An empty value would make the child inherit the process's own directory, which is the
+# installation; refuse instead of silently reintroducing the lock.
+if ([string]::IsNullOrWhiteSpace($LaunchWorkingDirectory)) {
+    throw "USERPROFILE is empty: refusing to start omp-web from inside its installation directory."
+}
 $PkgVersion = "0.0.0"
 if (Test-Path $PkgJsonPath) {
     try { $pkg = Get-Content $PkgJsonPath -Raw | ConvertFrom-Json; if ($pkg.version) { $PkgVersion = $pkg.version } } catch { }
