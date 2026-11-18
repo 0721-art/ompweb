@@ -6,6 +6,11 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Upgrading from 0.7.1 or older
+
+- **Start ompweb again after the in-app update.** The updater of 0.6.0, 0.7.0 and 0.7.1 installs the new version and reports success, but an `ompweb` you started yourself (no systemd, launchd or tray supervisor) does not come back: the old launcher exits with the server. If the page does not return, run `ompweb` again. The cause is in the old version's own updater, which this release cannot change.
+- **Then update each host with Force.** A 0.7.x host daemon sharing the installation is shown in Settings → Hosts after the restart; its normal update is refused while the package was replaced under it, so use **Force update** to move it to this release.
+
 ### Added
 
 - **Update omp on a host without a new ompweb release.** Settings → Hosts shows "Update omp to …" for a host whose omp is older than the newest published release of the oh-my-pi fork whose runner speaks this ompweb's runner protocol (`RUNNER_PROTOCOL`; a release that speaks another one is never offered). The daemon downloads the runner into a fresh staging directory, checks its SHA-256, its `--runner-info` protocol and `--smoke-test` there, and only then moves it into place and points new sessions at it; any failure leaves the runner in use and its pointer as they were, and running sessions are not interrupted. A caller's `operationId` names one omp update: a replay returns the stored operation and installs nothing again, and a conflicting request, or a replay of an attempt a later one superseded, is refused (`operation_conflict`). An omp update keeps its own record and never touches an ompweb update's: the two never run together, and each is refused with a machine-readable blocker (`ompweb_update_active`, `omp_install_active`) while the other runs.
