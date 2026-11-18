@@ -6,6 +6,14 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Added
+
+- **Update omp on a host without a new ompweb release.** Settings → Hosts shows "Update omp to …" for a host whose omp is older than the newest published release of the oh-my-pi fork whose runner speaks this ompweb's runner protocol (`RUNNER_PROTOCOL`; a release that speaks another one is never offered). The daemon downloads the runner into a fresh staging directory, checks its SHA-256, its `--runner-info` protocol and `--smoke-test` there, and only then moves it into place and points new sessions at it; any failure leaves the runner in use and its pointer as they were, and running sessions are not interrupted. A caller's `operationId` names one omp update: a replay returns the stored operation and installs nothing again, and a conflicting request, or a replay of an attempt a later one superseded, is refused (`operation_conflict`). An omp update keeps its own record and never touches an ompweb update's: the two never run together, and each is refused with a machine-readable blocker (`ompweb_update_active`, `omp_install_active`) while the other runs.
+
+### Changed
+
+- **The omp runner is built and released by the oh-my-pi fork.** `runner/` and its workflows are gone from this repository: the fork's `oml` build compiles `ompweb-omp` for every platform and attaches it to its releases with `ompweb-omp.sha256` and `ompweb-omp.json` (the runner protocol). Root `omp-runner.json` pins the fork release an ompweb build fetches its runner from (`ompweb fetch-omp`, and in the background when it is missing), SHA-256-checked; source checkouts, CI, smoke tests and binary builds download it (`scripts/fetch-runner.ts`, `npm run fetch-omp`) instead of building it, and releases and prereleases record the newest published fork release with a matching protocol. `OMP_WEB_OMP_BIN` still overrides it. A source checkout needs `npm run fetch-omp` once per pin, not a runner build.
+
 ### Fixed
 
 - **In-app updates can replace an npm-global Windows install started by the tray.** The update stops the tray program in the package and any node or bun process still using that install, without ending the update itself, and runs the install from outside the package so Windows can rename it. When the tray started the server, it is started again in the logged-on session and starts the one server; otherwise the server is started directly and still told which install to serve.
