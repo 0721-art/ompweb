@@ -6,6 +6,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Fixed
+
+- **A linked host on 0.7.1 or older updates normally again.** Once this server's own release was published, Settings → Hosts refused the normal update of an older linked host's daemon with "This host requires explicitly approved recovery": the forced-recovery method the server now offers such a host was applied to every update, not only to **Force update**. A normal update goes through that host's own updater again. This machine's older daemon is still updated with **Force update**, as before.
+
 ## [v0.7.2] - 2026-11-18
 
 ### Upgrading from 0.7.1 or older
