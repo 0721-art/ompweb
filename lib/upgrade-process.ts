@@ -93,7 +93,16 @@ function assertTrustedFile(path: string, what: string): void {
 
 // ---------------------------------------------------------------- processes
 
-interface ProcessInfo { pid: number; ppid: number; state: string; exe: string; args: string[]; cwd: string | null; created: string | null }
+export interface ProcessInfo { pid: number; ppid: number; state: string; name: string; exe: string; args: string[]; cwd: string | null; created: string | null }
+
+/**
+ * The Windows service host also parents the tree of a scheduled task, so it is never a candidate supervisor.
+ * Compare the process name: `Win32_Process.ExecutablePath` is empty for processes a non-admin account may not
+ * read (svchost included), and a service then looked like the supervisor of a task-scheduled daemon.
+ */
+export function isServiceHostProcess(row: Pick<ProcessInfo, "name" | "exe">): boolean {
+  return /^svchost\.exe$/i.test(row.name || basename(row.exe));
+}
 
 /** CommandLineToArgvW's rules: whitespace separates arguments, quotes group, backslashes escape only before a quote. */
 function splitWindowsCommandLine(line: string): string[] {
@@ -186,14 +195,15 @@ async function listProcesses(): Promise<ProcessInfo[]> {
         const stat = readFileSync(`/proc/${id}/stat`, "utf8");
         const [state, ppid] = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
         const link = (name: string) => { try { return readlinkSync(`/proc/${id}/${name}`).replace(/ \(deleted\)$/, ""); } catch { return null; } };
-        rows.push({ pid, ppid: Number(ppid), state, exe: link("exe") ?? "", args: readFileSync(`/proc/${id}/cmdline`, "utf8").split("\0").filter(Boolean), cwd: link("cwd"), created: null });
+        const comm = (() => { try { return readFileSync(`/proc/${id}/comm`, "utf8").trim(); } catch { return ""; } })();
+        rows.push({ pid, ppid: Number(ppid), state, name: comm, exe: link("exe") ?? "", args: readFileSync(`/proc/${id}/cmdline`, "utf8").split("\0").filter(Boolean), cwd: link("cwd"), created: null });
       } catch { /* exited while listing */ }
     }
     return rows;
   }
   if (process.platform === "win32") {
-    const out = await powershell(`$rows = @(Get-CimInstance Win32_Process | ForEach-Object { [pscustomobject]@{ pid = [int]$_.ProcessId; ppid = [int]$_.ParentProcessId; exe = [string]$_.ExecutablePath; cmd = [string]$_.CommandLine; created = $(if ($_.CreationDate) { [string]$_.CreationDate.ToUniversalTime().Ticks } else { '' }) } })\nConvertTo-Json -Compress -InputObject $rows`, 120000);
-    return parseJson<{ pid: number; ppid: number; exe: string; cmd: string; created: string }[]>(out, "process list").map((row) => ({ pid: row.pid, ppid: row.ppid, state: "R", exe: row.exe, args: splitWindowsCommandLine(row.cmd), cwd: null, created: row.created || null }));
+    const out = await powershell(`$rows = @(Get-CimInstance Win32_Process | ForEach-Object { [pscustomobject]@{ pid = [int]$_.ProcessId; ppid = [int]$_.ParentProcessId; name = [string]$_.Name; exe = [string]$_.ExecutablePath; cmd = [string]$_.CommandLine; created = $(if ($_.CreationDate) { [string]$_.CreationDate.ToUniversalTime().Ticks } else { '' }) } })\nConvertTo-Json -Compress -InputObject $rows`, 120000);
+    return parseJson<{ pid: number; ppid: number; name: string; exe: string; cmd: string; created: string }[]>(out, "process list").map((row) => ({ pid: row.pid, ppid: row.ppid, state: "R", name: row.name || "", exe: row.exe, args: splitWindowsCommandLine(row.cmd), cwd: null, created: row.created || null }));
   }
   const env = { ...process.env, LC_ALL: "C" };
   const [commands, names] = await Promise.all([
@@ -207,7 +217,7 @@ async function listProcesses(): Promise<ProcessInfo[]> {
     const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
     if (match) {
       const exe = exes.get(Number(match[1])) ?? "";
-      rows.push({ pid: Number(match[1]), ppid: Number(match[2]), state: match[3], exe, args: posixArguments(match[4].trim(), exe), cwd: null, created: null });
+      rows.push({ pid: Number(match[1]), ppid: Number(match[2]), state: match[3], name: basename(exe), exe, args: posixArguments(match[4].trim(), exe), cwd: null, created: null });
     }
   }
   return rows;
@@ -517,8 +527,8 @@ async function inspectWindowsSupervisor(me: ProcessInfo, rows: ProcessInfo[], in
   const normal = (value: string) => value.toLowerCase().replaceAll("\\", "/");
   const scripts = [...new Set(chain.slice(1).flatMap((row) => row.args.slice(1).filter((arg) => /\.(?:ps1|cmd|bat|vbs)$/i.test(arg))))];
   const found = parseJson<{ services: WindowsService[]; tasks: WindowsTask[] }>(await powershell(
-    // A scheduled task's tree hangs under the Schedule service's svchost (shared by many services): never a candidate supervisor.
-    `$ids = @(${chain.filter((row) => !/(^|[\\/])svchost\.exe$/i.test(row.exe)).map((row) => row.pid).join(",")})\n$scripts = ${psStrings(scripts.map(normal))}\n` +
+    // Never a candidate supervisor: a scheduled task's tree hangs under the service host (see isServiceHostProcess).
+    `$ids = @(${chain.filter((row) => !isServiceHostProcess(row)).map((row) => row.pid).join(",")})\n$scripts = ${psStrings(scripts.map(normal))}\n` +
     `$services = @(Get-CimInstance Win32_Service | Where-Object { $_.ProcessId -and ($ids -contains [int]$_.ProcessId) } | ForEach-Object { ${SERVICE_FIELDS} })\n` +
     `$tasks = @()\nif ($scripts.Count -gt 0) { $tasks = @(Get-ScheduledTask | ForEach-Object { $t = $_; $text = ((@($t.Actions | ForEach-Object { $_.Execute + ' ' + $_.Arguments })) -join ' ').ToLowerInvariant().Replace('\\', '/'); $hit = $false; foreach ($s in $scripts) { if ($text.Contains($s)) { $hit = $true } }; if ($hit) { ${TASK_FIELDS} } }) }\n` +
     `ConvertTo-Json -Compress -Depth 6 -InputObject ([pscustomobject]@{ services = $services; tasks = $tasks })`), "supervisor query");
